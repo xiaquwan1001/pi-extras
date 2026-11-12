@@ -1,0 +1,229 @@
+/**
+ * Offline self-checks for the repository. No network, no Pi process, no model calls.
+ *
+ *   npm run smoke
+ *
+ * 1. fabric-agent-echo: build a fake Fabric run root (owner file, status.json,
+ *    events.jsonl) and assert the parser picks the right runs and rebuilds the
+ *    conversation, including nested runs, filters, and dedupe.
+ * 2. fabric-hardening: build a fake package tree that contains every upstream
+ *    snippet, assert every patch applies, is idempotent on a second pass, and
+ *    leaves syntactically valid files (node --check).
+ */
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const { collectRuns, buildTranscript, ownedRoots, statusFiles } = await import(
+	"../packages/fabric-agent-echo/extensions/core.ts"
+);
+const { applyPatches, PATCHES } = await import("../packages/fabric-hardening/extensions/patches.ts");
+
+const root = mkdtempSync(join(tmpdir(), "pi-extras-smoke-"));
+const passed = [];
+const check = (name, fn) => {
+	try {
+		fn();
+		passed.push(name);
+	} catch (error) {
+		console.error(`FAIL ${name}\n${error.stack ?? error}`);
+		process.exitCode = 1;
+	}
+};
+
+// ---------------------------------------------------------------- agent-echo
+const tmpRoot = join(root, "tmp");
+const runsRoot = join(tmpRoot, "pi-fabric-runs-test1");
+const fakePid = 4242;
+
+function writeRun(id, record, events) {
+	const dir = join(runsRoot, id);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "status.json"), JSON.stringify({ id, ...record }));
+	writeFileSync(join(dir, "events.jsonl"), events.map((event) => JSON.stringify(event)).join("\n"));
+}
+
+mkdirSync(runsRoot, { recursive: true });
+writeFileSync(join(runsRoot, ".fabric-owner.json"), JSON.stringify({ pid: fakePid }));
+
+writeRun(
+	"aaa111",
+	{ status: "completed", name: "summarize docs", model: "gw/m1", turns: 2, toolCalls: 1, startedAt: 1000, finishedAt: 2000, usage: { input: 1000, output: 20 } },
+	[
+		{ type: "extension_ui_request", method: "notify", message: "noise" },
+		{ type: "message_end", message: { role: "system", content: "ignored" } },
+		{ type: "message_end", message: { role: "user", content: [{ type: "text", text: "read the docs" }] } },
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "not shown" },
+					{ type: "text", text: "I will grep." },
+					{ type: "toolCall", name: "grep", arguments: { pattern: "TODO", path: "docs" } },
+				],
+			},
+		},
+		{ type: "message_end", message: { role: "toolResult", toolName: "grep", content: [{ type: "text", text: "docs/a.md: TODO" }] } },
+		{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done: 1 TODO." }] } },
+	],
+);
+// still running -> must be ignored
+writeRun("bbb222", { status: "running", name: "still working", startedAt: 1500 }, []);
+// persistent actor -> must be ignored
+writeRun("ccc333", { status: "completed", name: "actor", actorId: "actor-1", startedAt: 1000, finishedAt: 2000 }, []);
+// failed run -> included
+writeRun("ddd444", { status: "failed", name: "broken", startedAt: 1000, finishedAt: 3000, logFile: join(runsRoot, "ddd444", "events.jsonl") }, []);
+// nested run (child of a child) with its own status.json
+writeRun("eee555", { status: "completed", name: "nested", startedAt: 1000, finishedAt: 2500 }, []);
+const nestedDir = join(runsRoot, "aaa111", "nested");
+mkdirSync(nestedDir, { recursive: true });
+writeFileSync(join(nestedDir, "status.json"), JSON.stringify({ id: "aaa111-nested", status: "completed", name: "leaf", startedAt: 1100, finishedAt: 1200 }));
+writeFileSync(join(nestedDir, "events.jsonl"), JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "text", text: "leaf task" }] } }) + "\n");
+
+check("agent-echo: finds only this pid's run roots", () => {
+	assert.deepEqual(ownedRoots(fakePid, tmpRoot), [runsRoot]);
+	assert.deepEqual(ownedRoots(fakePid + 1, tmpRoot), []);
+});
+
+check("agent-echo: finds nested status files", () => {
+	assert.equal(statusFiles(runsRoot).length, 6);
+});
+
+check("agent-echo: collects terminal, non-actor runs (nested included), oldest first", () => {
+	const runs = collectRuns({ pid: fakePid, tmpRoot, since: 0 });
+	const ids = runs.map((run) => run.id);
+	assert.deepEqual(ids, ["aaa111-nested", "aaa111", "eee555", "ddd444"]);
+	const broken = runs.find((run) => run.id === "ddd444");
+	assert.equal(broken.status, "failed");
+});
+
+check("agent-echo: rebuilds the conversation and drops thinking", () => {
+	const first = collectRuns({ pid: fakePid, tmpRoot, since: 0, idFilter: "aaa111" }).find((run) => run.id === "aaa111");
+	const text = first.transcript.join("\n");
+	assert.match(text, /▸ user: read the docs/);
+	assert.match(text, /⚙ grep\(\{"pattern":"TODO","path":"docs"\}\)/);
+	assert.match(text, /← grep: docs\/a\.md: TODO/);
+	assert.match(text, /▸ assistant: Done: 1 TODO\./);
+	assert.doesNotMatch(text, /not shown/);
+	assert.doesNotMatch(text, /noise/);
+});
+
+check("agent-echo: honors since / idFilter / skip", () => {
+	assert.equal(collectRuns({ pid: fakePid, tmpRoot, since: 2000 }).length, 3); // finishedAt >= 2000
+	assert.equal(collectRuns({ pid: fakePid, tmpRoot, since: 0, idFilter: "eee" }).length, 1);
+	assert.equal(
+		collectRuns({ pid: fakePid, tmpRoot, since: 0, skip: (id) => id !== "ddd444" }).length,
+		1,
+	);
+});
+
+check("agent-echo: falls back when the transcript is gone", () => {
+	const record = { id: "x", status: "completed" };
+	assert.deepEqual(buildTranscript(record, join(root, "nope", "status.json")), ["(events.jsonl was cleaned up or has expired)"]);
+});
+
+// -------------------------------------------------------------- hardening
+const npmDir = join(root, "node_modules");
+const fabDist = join(npmDir, "pi-fabric", "dist");
+const chunkDir = join(fabDist, "chunks");
+const foldExt = join(npmDir, "pi-fold", "extensions");
+mkdirSync(chunkDir, { recursive: true });
+mkdirSync(foldExt, { recursive: true });
+mkdirSync(join(fabDist, "worker"), { recursive: true });
+writeFileSync(join(npmDir, "pi-fabric", "package.json"), JSON.stringify({ name: "pi-fabric", type: "module" }));
+writeFileSync(join(npmDir, "pi-fold", "package.json"), JSON.stringify({ name: "pi-fold", type: "module" }));
+// upstream text, spread over renamed chunk files like the real build
+writeFileSync(
+	join(chunkDir, "chunk-AAA.js"),
+	'var writeRecord = (filePath, record) => {\n  writeJsonAtomic(filePath, record, { space: 2 });\n};\nvar x = 1;\n',
+);
+writeFileSync(
+	join(chunkDir, "chunk-BBB.js"),
+	'var RETRYABLE_RENAME_CODES = /* @__PURE__ */ new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);\nexport { RETRYABLE_RENAME_CODES };\n',
+);
+writeFileSync(
+	join(chunkDir, "chunk-CCC.js"),
+	'var RETRYABLE_RENAME_CODES = /* @__PURE__ */ new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);\nexport { RETRYABLE_RENAME_CODES };\n',
+);
+writeFileSync(join(fabDist, "worker", "recovery-watchdog.js"), "var PI_RECOVERY_TIMEOUT_MS = 6e4;\nexport { PI_RECOVERY_TIMEOUT_MS };\n");
+writeFileSync(
+	join(fabDist, "worker.js"),
+	[
+		"const runnerLabel = (r) => r;",
+		"export async function run(options) {",
+		"  const exitCode = await new Promise((resolve) => {",
+		'    child.once("close", (code) => resolve(code));',
+		"  });",
+		"  record.exitCode = exitCode;",
+		"  record.stderr = stderr.slice(-MAX_STDERR_CHARS);",
+		'  if (record.status === "failed" && !record.error) {',
+		'    record.error = stderr.trim() || (exitCode === 0 ? `${runnerLabel(options.runner)} agent reported an error before exiting` : `${runnerLabel(options.runner)} exited with code ${exitCode ?? "unknown"}`);',
+		"  }",
+		"}",
+	].join("\n"),
+);
+writeFileSync(
+	join(foldExt, "evidence.js"),
+	[
+		"export function ingest({ sessionFile }) {",
+		'  if (typeof sessionFile !== "string" || !isAbsolute(sessionFile)) {',
+		'    throw new Error("Evidence ingestion requires an absolute Pi session file");',
+		"  }",
+		"  return true;",
+		"}",
+	].join("\n"),
+);
+
+const first = applyPatches({ npmDir });
+const second = applyPatches({ npmDir });
+
+check("hardening: every patch applies to the upstream text", () => {
+	assert.deepEqual(
+		first.applied.map((entry) => entry.id).sort(),
+		PATCHES.map((patch) => patch.id).sort(),
+	);
+	assert.equal(first.skipped.length, 0);
+});
+
+check("hardening: applies to files found by content, not by name", () => {
+	const rename = first.applied.find((entry) => entry.id === "rename-quota-retry");
+	assert.equal(rename.files.length, 2);
+});
+
+check("hardening: second pass is a no-op", () => {
+	assert.equal(second.applied.length, 0);
+	assert.equal(second.already.length, PATCHES.length);
+});
+
+check("hardening: patched files still parse", () => {
+	const files = first.applied.flatMap((entry) => entry.files);
+	assert.ok(files.length >= PATCHES.length);
+	for (const file of files) {
+		const result = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" });
+		assert.equal(result.status, 0, `${file}: ${result.stderr}`);
+	}
+});
+
+check("hardening: missing package fails soft", () => {
+	const report = applyPatches({ npmDir: join(root, "empty-node-modules") });
+	assert.equal(report.applied.length, 0);
+	assert.ok(report.skipped.every((entry) => entry.reason === "missing"));
+});
+
+check("hardening: include/exclude selection", () => {
+	const report = applyPatches({ npmDir, include: ["status-write-guard"] });
+	assert.ok(report.skipped.every((entry) => entry.reason === "disabled"));
+	const excluded = applyPatches({ npmDir, exclude: PATCHES.map((patch) => patch.id) });
+	assert.equal(excluded.applied.length, 0);
+});
+
+rmSync(root, { recursive: true, force: true });
+
+if (process.exitCode) {
+	console.error(`\n${passed.length} check(s) passed, some failed`);
+} else {
+	console.log(`all ${passed.length} checks passed`);
+}

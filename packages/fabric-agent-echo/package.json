@@ -1,0 +1,37 @@
+{
+  "name": "pi-fabric-agent-echo",
+  "version": "0.1.0",
+  "description": "Keep completed pi-fabric subagent conversations in the main Pi transcript as collapsible, model-invisible entries.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Qianhui Xu",
+  "homepage": "https://github.com/xiaquwan1001/pi-extras/tree/main/packages/fabric-agent-echo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaquwan1001/pi-extras.git",
+    "directory": "packages/fabric-agent-echo"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaquwan1001/pi-extras/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-fabric",
+    "subagents",
+    "transcript"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
