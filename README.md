@@ -2,13 +2,15 @@
 
 Small, dependency-free [Pi](https://pi.dev) extensions, extracted from daily use. Each one is an independent npm package; install only what you need.
 
-| Package | What it fixes |
-| --- | --- |
-| [**pi-fabric-agent-echo**](packages/fabric-agent-echo) | Completed [pi-fabric](https://github.com/fabric-runtime/pi-fabric) subagent conversations stay in your transcript as collapsible, model-invisible cards instead of disappearing behind `/fabric chat`. |
-| [**pi-model-speed**](packages/model-speed) | Measures real TTFT/TPOT per request and steps off a model that is consistently slow — within the same provider, never across. |
-| [**pi-fabric-hardening**](packages/fabric-hardening) | Idempotent runtime patches for pi-fabric/pi-fold: survive a full tmpfs, keep the real cause of a dead child, configurable recovery watchdog. |
+| Package | npm | What it fixes |
+| --- | --- | --- |
+| [**pi-fabric-agent-echo**](packages/fabric-agent-echo) | [![npm](https://img.shields.io/npm/v/pi-fabric-agent-echo.svg)](https://www.npmjs.com/package/pi-fabric-agent-echo) | Completed [pi-fabric](https://github.com/fabric-runtime/pi-fabric) subagent conversations stay in your transcript as collapsible, model-invisible cards instead of disappearing behind `/fabric chat`. |
+| [**pi-model-speed**](packages/model-speed) | [![npm](https://img.shields.io/npm/v/pi-model-speed.svg)](https://www.npmjs.com/package/pi-model-speed) | Measures real TTFT/TPOT per request and steps off a model that is consistently slow — within the same provider, never across. |
+| [**pi-fabric-hardening**](packages/fabric-hardening) | [![npm](https://img.shields.io/npm/v/pi-fabric-hardening.svg)](https://www.npmjs.com/package/pi-fabric-hardening) | Idempotent runtime patches for pi-fabric/pi-fold: survive a full tmpfs, keep the real cause of a dead child, configurable recovery watchdog. |
 
 ## Install
+
+All three are published on npm (`latest` = 0.1.0) and carry the `pi-package` keyword, so they show up in the Pi package gallery.
 
 ```bash
 pi install npm:pi-fabric-agent-echo
