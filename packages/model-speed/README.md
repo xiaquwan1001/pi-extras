@@ -18,7 +18,9 @@ Samples stay in memory for `/speed-stats` and are appended to `~/.cache/pi-model
 
 **Slow-streak failover.** If the current model is slow — TTFT over the threshold *or* TPOT over the threshold, bucketed by prompt size — for `window` consecutive turns, the extension switches to the fastest **other model of the same provider**. It never crosses providers, because that changes pricing and capabilities behind your back.
 
-Guards: once per `cooldownMs`, at most once per session, skipped while a manual `/model` is driving.
+Guards: once per `cooldownMs`, at most once per session, skipped while a manual `/model` is driving, and the target must be **clearly** faster (`minImprovementRatio` / `minImprovementMs`) — a 13 s → 12 s "win" is not worth re-billing the prompt.
+
+**A warm session is expensive to leave.** Switching models discards the gateway's prefix cache and re-pays for the whole prompt, so a session that has already run `sessionBinding.warmTurns` turns (or `warmAfterMs` of wall time, or one turn whose prompt is past `thresholds.largePromptTokens`) is *bound*: its slow thresholds are multiplied by `boundThresholdMultiplier`, TTFT never triggers a switch below `boundMinTtftMs`, and the switch log/notification says `session bound`. A bound session stays on a model that is 20% slower, and still walks away from one that stalls for a minute.
 
 **Never inside a Fabric child.** A process launched by `fabric_exec` (it carries `PI_FABRIC_LINEAGE` / `PI_FABRIC_DEPTH`) keeps the model its parent assigned: Pi Fabric's model admission reads a mid-run switch as drift. Sampling still runs there, so child timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging.
 
@@ -57,6 +59,14 @@ Optional file `~/.pi/agent/model-speed.json`:
   },
   "window": 3,
   "cooldownMs": 600000,
+  "sessionBinding": {
+    "warmTurns": 3,
+    "warmAfterMs": 600000,
+    "boundThresholdMultiplier": 3,
+    "boundMinTtftMs": 60000,
+    "minImprovementRatio": 1.6,
+    "minImprovementMs": 5000
+  },
   "probe": {
     "command": ["bash", "/home/me/bin/model-probe.sh"],
     "file": "/home/me/.cache/model-probe.json"
@@ -74,6 +84,12 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `thresholds.tpotMs` | `250` | Slow output rate (≈4 tokens/s) |
 | `window` | `3` | Consecutive slow turns before switching |
 | `cooldownMs` | `600000` | Do not switch more often than this |
+| `sessionBinding.warmTurns` | `3` | Turns after which the session counts as bound (prefix cache already paid) |
+| `sessionBinding.warmAfterMs` | `600000` | …or this much wall time into the session |
+| `sessionBinding.boundThresholdMultiplier` | `3` | Bound sessions use `thresholds` × this |
+| `sessionBinding.boundMinTtftMs` | `60000` | Bound sessions never switch on a TTFT below this |
+| `sessionBinding.minImprovementRatio` | `1.6` | Target must be this much faster than the current model |
+| `sessionBinding.minImprovementMs` | `5000` | …and at least this many ms faster |
 | `probe.command` | — | Optional external probe, run by `/speed` and never automatically |
 | `probe.file` | — | That probe's output: `{ "ts": 1700000000, "models": { "<id>": { "ok": true, "ttft": 1.2 } } }` (`ttft` in seconds) |
 

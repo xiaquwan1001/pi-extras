@@ -13,6 +13,14 @@
  *    (never across providers — that changes pricing and capabilities). Once per
  *    cooldown, at most once per session, and a manual `/model` resets everything.
  *
+ * 3. **A warm session is expensive to leave.** Switching models throws away the
+ *    gateway's prefix cache and re-pays for the whole prompt, so once the session is
+ *    *bound* (after `sessionBinding.warmTurns` turns or `warmAfterMs`, or as soon as a
+ *    turn's prompt is past `thresholds.largePromptTokens`) the slow thresholds are
+ *    multiplied and no target is taken unless it is clearly faster
+ *    (`minImprovementRatio` / `minImprovementMs`). A warm session only steps off a
+ *    model that is genuinely broken, not one that is 20% slower.
+ *
  * Ranking sources, in order: an optional external probe file (e.g. a cron job that
  * times each model), then this extension's own sample history, then registry order.
  *
@@ -26,6 +34,14 @@
  *   "thresholds": { "ttftSmallMs": 12000, "ttftLargeMs": 25000, "largePromptTokens": 30000, "tpotMs": 250 },
  *   "window": 3,
  *   "cooldownMs": 600000,
+ *   "sessionBinding": {
+ *     "warmTurns": 3,              // turns after which the session counts as bound
+ *     "warmAfterMs": 600000,       // ... or this much wall time into the session
+ *     "boundThresholdMultiplier": 3,  // bound sessions use thresholds × this
+ *     "boundMinTtftMs": 60000,     // ... but never less than this TTFT before switching
+ *     "minImprovementRatio": 1.6,  // a target must be this much faster than the current model
+ *     "minImprovementMs": 5000     // ... and at least this many ms faster
+ *   },
  *   "probe": { "command": ["bash", "/path/probe.sh"], "file": "/path/last-probe.json" }
  * }
  *
@@ -63,6 +79,14 @@ const LOG = join(STATE_DIR, "speed-log.jsonl");
 const SWITCH_STATE = join(STATE_DIR, "switch-state.json");
 
 type Thresholds = { ttftSmallMs: number; ttftLargeMs: number; largePromptTokens: number; tpotMs: number };
+type SessionBinding = {
+	warmTurns: number;
+	warmAfterMs: number;
+	boundThresholdMultiplier: number;
+	boundMinTtftMs: number;
+	minImprovementRatio: number;
+	minImprovementMs: number;
+};
 type Config = {
 	auto: boolean;
 	providers: string[];
@@ -70,6 +94,7 @@ type Config = {
 	thresholds: Thresholds;
 	window: number;
 	cooldownMs: number;
+	sessionBinding: SessionBinding;
 	probe: { command?: string[]; file?: string };
 };
 
@@ -85,6 +110,14 @@ const DEFAULT_CONFIG: Config = {
 	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250 },
 	window: 3,
 	cooldownMs: 600_000,
+	sessionBinding: {
+		warmTurns: 3,
+		warmAfterMs: 600_000,
+		boundThresholdMultiplier: 3,
+		boundMinTtftMs: 60_000,
+		minImprovementRatio: 1.6,
+		minImprovementMs: 5_000,
+	},
 	probe: {},
 };
 
@@ -111,6 +144,8 @@ let pending: Array<Sample> = [];
 let lastSwitchAt = 0;
 let switchedThisSession = false;
 let switchTarget: string | undefined;
+let sessionStartedAt = 0;
+let turnCount = 0;
 
 async function loadConfig(): Promise<Config> {
 	let raw: Record<string, any> = {};
@@ -134,6 +169,14 @@ async function loadConfig(): Promise<Config> {
 		},
 		window: Math.max(2, Math.floor(num(process.env.PI_MODEL_SPEED_WINDOW, num(raw.window, 3)))),
 		cooldownMs: num(raw.cooldownMs, DEFAULT_CONFIG.cooldownMs),
+		sessionBinding: {
+			warmTurns: Math.max(1, Math.floor(num(raw.sessionBinding?.warmTurns, DEFAULT_CONFIG.sessionBinding.warmTurns))),
+			warmAfterMs: num(raw.sessionBinding?.warmAfterMs, DEFAULT_CONFIG.sessionBinding.warmAfterMs),
+			boundThresholdMultiplier: Math.max(1, num(raw.sessionBinding?.boundThresholdMultiplier, DEFAULT_CONFIG.sessionBinding.boundThresholdMultiplier)),
+			boundMinTtftMs: num(raw.sessionBinding?.boundMinTtftMs, DEFAULT_CONFIG.sessionBinding.boundMinTtftMs),
+			minImprovementRatio: Math.max(1, num(raw.sessionBinding?.minImprovementRatio, DEFAULT_CONFIG.sessionBinding.minImprovementRatio)),
+			minImprovementMs: num(raw.sessionBinding?.minImprovementMs, DEFAULT_CONFIG.sessionBinding.minImprovementMs),
+		},
 		probe: {
 			command: Array.isArray(raw.probe?.command) && raw.probe.command.length ? raw.probe.command.map(String) : undefined,
 			file: typeof raw.probe?.file === "string" ? raw.probe.file : undefined,
@@ -236,21 +279,46 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Candidate[]> {
 	return candidates.sort((a, b) => (a.ttftMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? Number.POSITIVE_INFINITY));
 }
 
+/**
+ * A session is *bound* when leaving it costs more than the slowdown: the prefix cache
+ * is already paid for, the prompt has grown past `largePromptTokens`, or enough turns
+ * have gone by that a switch would re-bill the whole context. Bound sessions keep their
+ * model unless it is catastrophically slow.
+ */
+function sessionBound(): boolean {
+	if (turnCount >= config.sessionBinding.warmTurns) return true;
+	if (sessionStartedAt > 0 && Date.now() - sessionStartedAt >= config.sessionBinding.warmAfterMs) return true;
+	for (let i = samples.length - 1; i >= 0; i -= 1) {
+		const sample = samples[i];
+		if (sample.error) continue;
+		return (sample.promptTokens ?? 0) >= config.thresholds.largePromptTokens;
+	}
+	return false;
+}
+
 /** The last `window` usable samples, if every one of them was slow and recent. */
-function slowStreak(): Sample[] | null {
+function slowStreak(): { tail: Sample[]; bound: boolean } | null {
 	const usable = samples.filter((s) => !s.error && s.ttftMs !== undefined);
 	if (usable.length < config.window) return null;
 	const tail = usable.slice(-config.window);
 	const now = Date.now();
 	if (tail.some((s) => now - s.startedAt > config.cooldownMs)) return null;
+	const bound = sessionBound();
+	const multiplier = bound ? config.sessionBinding.boundThresholdMultiplier : 1;
 	for (const sample of tail) {
 		const prompt = sample.promptTokens ?? 0;
-		const ttftLimit = prompt >= config.thresholds.largePromptTokens ? config.thresholds.ttftLargeMs : config.thresholds.ttftSmallMs;
+		const promptLimit = prompt >= config.thresholds.largePromptTokens ? config.thresholds.ttftLargeMs : config.thresholds.ttftSmallMs;
+		// Bound sessions get a widened band, and an absolute floor: a 14 s TTFT on a warm
+		// 200k-token session is normal, a 60 s+ one is not.
+		const ttftLimit = bound
+			? Math.max(promptLimit * multiplier, config.sessionBinding.boundMinTtftMs)
+			: promptLimit * multiplier;
+		const tpotLimit = config.thresholds.tpotMs * multiplier;
 		const slowTtft = (sample.ttftMs ?? 0) > ttftLimit;
-		const slowTpot = (sample.tpotMs ?? 0) > config.thresholds.tpotMs;
+		const slowTpot = (sample.tpotMs ?? 0) > tpotLimit;
 		if (!slowTtft && !slowTpot) return null;
 	}
-	return tail;
+	return { tail, bound };
 }
 
 function probeSupported(): boolean {
@@ -340,6 +408,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 
 	// ---- slow-streak failover --------------------------------------------
 	pi.on("turn_end", async (_event, ctx) => {
+		turnCount += 1;
 		const current = ctx.model;
 		if (!current) return;
 		// A manual /model change means the user is driving: forget the session's switch.
@@ -360,15 +429,23 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		if (!streak) return;
 
 		const ranked = await rankCandidates(ctx);
+		const currentMedian = median(streak.tail.map((s) => s.ttftMs!));
+		// A barely-faster model is not worth the prefix cache: require a clear win.
 		const best = ranked.find(
-			(candidate) => candidate.id !== current.id && candidate.ttftMs !== undefined && Number.isFinite(candidate.ttftMs),
+			(candidate) =>
+				candidate.id !== current.id &&
+				candidate.ttftMs !== undefined &&
+				Number.isFinite(candidate.ttftMs) &&
+				candidate.ttftMs * config.sessionBinding.minImprovementRatio <= currentMedian &&
+				currentMedian - candidate.ttftMs >= config.sessionBinding.minImprovementMs,
 		);
-		const ttftMedian = fmtMs(median(streak.map((s) => s.ttftMs!)));
+		const ttftMedian = fmtMs(currentMedian);
+		const boundNote = streak.bound ? `, session bound (thresholds ×${config.sessionBinding.boundThresholdMultiplier})` : "";
 		if (!best) {
 			lastSwitchAt = Date.now();
 			await writeSwitchState({ lastSwitchAt });
 			ctx.ui.notify(
-				`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}), but no faster same-provider model is known yet`,
+				`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}${boundNote}), but no clearly faster same-provider model is known yet`,
 				"warning",
 			);
 			return;
@@ -382,10 +459,10 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		switchedThisSession = true;
 		switchTarget = best.id;
 		ctx.ui.notify(
-			`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}) → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})`,
+			`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}${boundNote}) → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})`,
 			"warning",
 		);
-		await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason: "slow", streak });
+		await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason: "slow", bound: streak.bound, streak: streak.tail });
 	});
 
 	// ---- startup ----------------------------------------------------------
@@ -395,6 +472,8 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		switchedThisSession = false;
 		switchTarget = undefined;
 		lastSwitchAt = 0;
+		turnCount = 0;
+		sessionStartedAt = Date.now();
 		config = await loadConfig();
 		if (event.reason === "reload") return;
 
