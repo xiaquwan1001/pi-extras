@@ -12,6 +12,9 @@
  *                                  a child killed by a signal reports the signal, and the
  *                                  exit mode is no longer hidden behind unrelated stderr
  *   5. evidence-no-session-guard   pi-fold skips evidence archiving for --no-session children
+ *   6. tolerate-same-provider-model-drift
+ *                                  a child that ends up on another model of the same provider
+ *                                  keeps running (recorded on stderr) instead of being killed
  *
  * Plus one process-level fix that needs no patching: when `/tmp` is a small tmpfs, point
  * TMPDIR at a real disk before Fabric creates its run roots.

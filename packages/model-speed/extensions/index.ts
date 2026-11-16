@@ -39,6 +39,24 @@ import { join } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+/**
+ * Fabric child sessions are launched on a model their parent named, and pi-fabric's
+ * strict model admission treats any later drift as a protocol violation and terminates
+ * the child ("requested X, but assistant reports Y; terminating child"). A failover
+ * switch inside a child therefore destroys work rather than rescuing it, so automatic
+ * switching is off whenever this process is a Fabric child. Sampling stays on: the
+ * child's samples still feed the shared history that ranking uses.
+ *
+ * Set PI_MODEL_SPEED_ALLOW_CHILD=1 to opt back in for debugging.
+ */
+const FABRIC_CHILD = Boolean(
+	process.env.PI_FABRIC_LINEAGE ||
+		process.env.PI_FABRIC_DEPTH ||
+		process.env.PI_FABRIC_AGENT_NAME ||
+		process.env.PI_FABRIC_MODEL_PIN,
+);
+const AUTO_IN_CHILD = process.env.PI_MODEL_SPEED_ALLOW_CHILD === "1";
+
 const CONFIG_PATH = process.env.PI_MODEL_SPEED_CONFIG?.trim() || join(homedir(), ".pi", "agent", "model-speed.json");
 const STATE_DIR = process.env.PI_MODEL_SPEED_DIR?.trim() || join(homedir(), ".cache", "pi-model-speed");
 const LOG = join(STATE_DIR, "speed-log.jsonl");
@@ -61,7 +79,7 @@ const num = (value: unknown, fallback: number) => {
 };
 
 const DEFAULT_CONFIG: Config = {
-	auto: process.env.PI_MODEL_SPEED !== "0",
+	auto: process.env.PI_MODEL_SPEED !== "0" && !(FABRIC_CHILD && !AUTO_IN_CHILD),
 	providers: [],
 	candidates: [],
 	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250 },
@@ -103,8 +121,9 @@ async function loadConfig(): Promise<Config> {
 	}
 	const thresholds = { ...DEFAULT_CONFIG.thresholds, ...(raw.thresholds ?? {}) };
 	const envThreshold = (name: string, fallback: number) => num(process.env[name], fallback);
+	const disabled = process.env.PI_MODEL_SPEED === "0" || (FABRIC_CHILD && !AUTO_IN_CHILD);
 	return {
-		auto: process.env.PI_MODEL_SPEED === "0" ? false : (raw.auto ?? DEFAULT_CONFIG.auto) !== false,
+		auto: disabled ? false : (raw.auto ?? DEFAULT_CONFIG.auto) !== false,
 		providers: Array.isArray(raw.providers) ? raw.providers.filter((v: unknown) => typeof v === "string") : [],
 		candidates: Array.isArray(raw.candidates) ? raw.candidates.filter((v: unknown) => typeof v === "string") : [],
 		thresholds: {
@@ -329,6 +348,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 			switchTarget = undefined;
 		}
 		if (!config.auto || switchedThisSession) return;
+		// Hard stop for Fabric children: a switch here is read as model drift by the
+		// parent and ends the run (see FABRIC_CHILD above). `/speed-auto on` cannot undo it.
+		if (FABRIC_CHILD && !AUTO_IN_CHILD) return;
 		if (Date.now() - lastSwitchAt < config.cooldownMs) return;
 		const shared = await readSwitchState();
 		if (shared.lastSwitchAt && Date.now() - shared.lastSwitchAt < config.cooldownMs) return;
@@ -461,7 +483,13 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				return;
 			}
 			config = { ...config, auto: arg === "on" };
-			ctx.ui.notify(`[model-speed] auto failover ${config.auto ? "on" : "off"} for this session`, "info");
+			const pinned = FABRIC_CHILD && !AUTO_IN_CHILD;
+			ctx.ui.notify(
+				pinned
+					? "[model-speed] auto failover is pinned off in Fabric child sessions (a mid-run switch terminates the run); sampling continues"
+					: `[model-speed] auto failover ${config.auto ? "on" : "off"} for this session`,
+				"info",
+			);
 		},
 	});
 

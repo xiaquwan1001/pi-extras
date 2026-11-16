@@ -139,6 +139,35 @@ export const PATCHES: Patch[] = [
 			"      : (stderrTail || howDied);",
 		].join("\n"),
 	},
+	// --- model admission: tolerate drift that does not change the provider contract -----
+	{
+		id: "tolerate-same-provider-model-drift",
+		packageName: "pi-fabric",
+		roots: ["dist"],
+		marker: "[pi-fabric-hardening:tolerate-same-provider-model-drift]",
+		label: "pi-fabric: same-provider model drift is recorded, not fatal",
+		original: [
+			'    } else if (this.#admission === "strict" && this.#expected && (!actual || key(actual) !== key(this.#expected))) {',
+			'      this.fail(`requested ${key(this.#expected)}, but assistant reports ${actual ? key(actual) : "missing model attribution"}; terminating child`);',
+			"    }",
+		].join("\n"),
+		patched: [
+			'    } else if (this.#admission === "strict" && this.#expected && !actual) {',
+			'      this.fail(`requested ${key(this.#expected)}, but assistant reports missing model attribution; terminating child`);',
+			'    } else if (this.#admission === "strict" && this.#expected && key(actual) !== key(this.#expected)) {',
+			"      // [pi-fabric-hardening:tolerate-same-provider-model-drift] A virtual gateway key can",
+			"      // resolve to a concrete backend at stream time (the USTC pool's alias ladder does this),",
+			"      // and a latency failover can re-point a child before the parent's launch label catches",
+			"      // up. Same provider means the same pricing/capability contract, so record the drift and",
+			"      // keep the work: killing an eight-turn child over it threw away every artifact.",
+			"      if (actual.provider === this.#expected.provider) {",
+			"        process.stderr.write(`[pi-fabric] model drift tolerated: requested ${key(this.#expected)}, serving ${key(actual)}\\n`);",
+			"      } else {",
+			"        this.fail(`requested ${key(this.#expected)}, but assistant reports ${key(actual)}; terminating child`);",
+			"      }",
+			"    }",
+		].join("\n"),
+	},
 	// --- pi-fold: a --no-session child has nothing to archive -------------------
 	{
 		id: "evidence-no-session-guard",

@@ -176,6 +176,28 @@ writeFileSync(
 		"}",
 	].join("\n"),
 );
+writeFileSync(
+	join(fabDist, "worker", "model-control.js"),
+	[
+		"class PiModelControl {",
+		"  #expected;",
+		"  #failed = false;",
+		'  #admission = "strict";',
+		"  observeAssistant(message) {",
+		'    if (message.role !== "assistant") return;',
+		"    const actual = identity({ provider: message.provider, id: message.model });",
+		"    if (actual) this.io.observed(key(actual));",
+		"    if (this.#failed) return;",
+		"    if (this.requested && !this.ready) {",
+		'      this.fail("child emitted an assistant message before model admission");',
+		'    } else if (this.#admission === "strict" && this.#expected && (!actual || key(actual) !== key(this.#expected))) {',
+		'      this.fail(`requested ${key(this.#expected)}, but assistant reports ${actual ? key(actual) : "missing model attribution"}; terminating child`);',
+		"    }",
+		"  }",
+		"}",
+		"export { PiModelControl };",
+	].join("\n"),
+);
 
 const first = applyPatches({ npmDir });
 const second = applyPatches({ npmDir });
@@ -221,6 +243,32 @@ check("hardening: include/exclude selection", () => {
 });
 
 rmSync(root, { recursive: true, force: true });
+
+// -------------------------------------------------------------- model-speed
+// A Fabric child that switches model is terminated by the parent's model admission,
+// so the extension must refuse the switch even when /speed-auto asks for it.
+{
+	const name = "model-speed: a Fabric child cannot switch models";
+	const previous = process.env.PI_FABRIC_LINEAGE;
+	process.env.PI_FABRIC_LINEAGE = '{"version":1,"rootSessionId":"t","runId":"t","depth":1,"childIndex":0,"worker":true}';
+	try {
+		const modelSpeed = await import("../packages/model-speed/extensions/index.ts");
+		const commands = new Map();
+		const notices = [];
+		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition) });
+		const command = commands.get("speed-auto");
+		assert.ok(command, "/speed-auto is registered");
+		await command.handler("on", { ui: { notify: (message) => notices.push(message) } });
+		assert.match(notices.at(-1) ?? "", /pinned off/);
+		passed.push(name);
+	} catch (error) {
+		console.error(`FAIL ${name}\n${error.stack ?? error}`);
+		process.exitCode = 1;
+	} finally {
+		if (previous === undefined) delete process.env.PI_FABRIC_LINEAGE;
+		else process.env.PI_FABRIC_LINEAGE = previous;
+	}
+}
 
 if (process.exitCode) {
 	console.error(`\n${passed.length} check(s) passed, some failed`);

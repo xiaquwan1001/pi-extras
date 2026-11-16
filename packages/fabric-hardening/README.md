@@ -13,6 +13,7 @@ Every fix here comes from a real incident where Fabric's failure mode was worse 
 | Children killed with `made no recovery progress for 60000ms` while still retrying | The recovery watchdog's timeout is a hardcoded 60 s and only resets on content deltas — longer than a slow gateway's TTFT, shorter than Pi's own retry backoff. |
 | Atomic state writes fail once and stay failed | `renameAtomic` retried `EPERM/EACCES/EEXIST/EBUSY` but not `EDQUOT/ENOSPC/EIO`, so quota pressure became permanent corruption. |
 | A `--no-session` child logs `Evidence ingestion requires an absolute Pi session file` | pi-fold's evidence hook throws when there is no session file, which then becomes the child's reported death cause. |
+| A child is killed with `requested X, but assistant reports Y; terminating child` after 8 turns and 0 artifacts | Model admission is strict even for a *different model of the same provider*, so a legitimate mid-run re-point (the pool's alias ladder, a latency failover) destroys finished work. |
 
 `pi install` runs with `--ignore-scripts` and upgrades replace `node_modules` wholesale, so a manual edit never survives. This extension re-applies a small patch set on every Pi start.
 
@@ -25,6 +26,7 @@ Every fix here comes from a real incident where Fabric's failure mode was worse 
 | `recovery-watchdog-timeout` | pi-fabric | timeout reads `PI_FABRIC_RECOVERY_TIMEOUT_MS`, default **600 000 ms** (was hardcoded 60 000) |
 | `exit-signal-decl`, `exit-signal-capture`, `exit-signal-record` | pi-fabric | the child's terminating signal is captured and stored as `exitSignal` |
 | `error-ordering` | pi-fabric | "was killed by SIGSEGV" comes first, `stderr` becomes `; last stderr: …` |
+| `tolerate-same-provider-model-drift` | pi-fabric | a child served by another model of the **same** provider logs the drift and keeps running; another *provider*, or a missing attribution, is still fatal |
 | `evidence-no-session-guard` | pi-fold | skip evidence archiving when there is no session file instead of throwing |
 
 Plus one patch-free fix: **TMPDIR relocation**. When `/tmp` is a tmpfs with less than `PI_FABRIC_TMPDIR_MIN_FREE_MB` (default 4096) MB free, `TMPDIR` is pointed at `~/.cache/pi-tmp` before Fabric creates its run roots. A real disk is left alone.

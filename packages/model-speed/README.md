@@ -20,6 +20,8 @@ Samples stay in memory for `/speed-stats` and are appended to `~/.cache/pi-model
 
 Guards: once per `cooldownMs`, at most once per session, skipped while a manual `/model` is driving.
 
+**Never inside a Fabric child.** A process launched by `fabric_exec` (it carries `PI_FABRIC_LINEAGE` / `PI_FABRIC_DEPTH`) keeps the model its parent assigned: Pi Fabric's model admission reads a mid-run switch as drift. Sampling still runs there, so child timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging.
+
 ## Install
 
 ```bash
