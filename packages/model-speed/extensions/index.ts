@@ -24,6 +24,14 @@
  * Ranking sources, in order: an optional external probe file (e.g. a cron job that
  * times each model), then this extension's own sample history, then registry order.
  *
+ * **Speed is only half of "is this model a valid target".** A candidate must also be
+ * able to hold the context the session already has: a provider that offers a fast
+ * 256k model next to a slow 1M one will otherwise hand a 300k-token session the 256k
+ * model, and the whole turn comes back as a 400 ContextWindowExceededError (in a
+ * Fabric child that is the entire run). Candidates whose declared `contextWindow` is
+ * below the session's current tokens plus `contextGuard.headroomTokens` are skipped
+ * and reported as such.
+ *
  * Commands: `/speed` (table + optional probe run), `/speed-stats`, `/speed on|off`.
  *
  * Config: `~/.pi/agent/model-speed.json` (all fields optional)
@@ -42,6 +50,7 @@
  *     "minImprovementRatio": 1.6,  // a target must be this much faster than the current model
  *     "minImprovementMs": 5000     // ... and at least this many ms faster
  *   },
+ *   "contextGuard": { "enabled": true, "headroomTokens": 32000 },
  *   "probe": { "command": ["bash", "/path/probe.sh"], "file": "/path/last-probe.json" }
  * }
  *
@@ -87,6 +96,7 @@ type SessionBinding = {
 	minImprovementRatio: number;
 	minImprovementMs: number;
 };
+type ContextGuard = { enabled: boolean; headroomTokens: number };
 type Config = {
 	auto: boolean;
 	providers: string[];
@@ -95,6 +105,7 @@ type Config = {
 	window: number;
 	cooldownMs: number;
 	sessionBinding: SessionBinding;
+	contextGuard: ContextGuard;
 	probe: { command?: string[]; file?: string };
 };
 
@@ -118,6 +129,7 @@ const DEFAULT_CONFIG: Config = {
 		minImprovementRatio: 1.6,
 		minImprovementMs: 5_000,
 	},
+	contextGuard: { enabled: true, headroomTokens: 32_000 },
 	probe: {},
 };
 
@@ -176,6 +188,10 @@ async function loadConfig(): Promise<Config> {
 			boundMinTtftMs: num(raw.sessionBinding?.boundMinTtftMs, DEFAULT_CONFIG.sessionBinding.boundMinTtftMs),
 			minImprovementRatio: Math.max(1, num(raw.sessionBinding?.minImprovementRatio, DEFAULT_CONFIG.sessionBinding.minImprovementRatio)),
 			minImprovementMs: num(raw.sessionBinding?.minImprovementMs, DEFAULT_CONFIG.sessionBinding.minImprovementMs),
+		},
+		contextGuard: {
+			enabled: process.env.PI_MODEL_SPEED_CONTEXT_GUARD !== "0" && raw.contextGuard?.enabled !== false,
+			headroomTokens: Math.max(0, num(raw.contextGuard?.headroomTokens, DEFAULT_CONFIG.contextGuard.headroomTokens)),
 		},
 		probe: {
 			command: Array.isArray(raw.probe?.command) && raw.probe.command.length ? raw.probe.command.map(String) : undefined,
@@ -253,31 +269,79 @@ const median = (values: number[]): number => {
 	return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 };
 
-const fmtMs = (ms?: number | null) => (ms === undefined || ms === null ? "—" : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
+const fmtMs = (ms?: number | null) =>
+	ms === undefined || ms === null ? "—" : !Number.isFinite(ms) ? "failed" : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 
-type Candidate = { id: string; ttftMs?: number; source: "probe" | "history" | "none" };
+type Candidate = { id: string; ttftMs?: number; source: "probe" | "history" | "none"; contextWindow?: number };
+/** A candidate that is fast enough but cannot hold the session's context. */
+type ExcludedCandidate = { id: string; contextWindow: number };
+type Ranking = { candidates: Candidate[]; excluded: ExcludedCandidate[]; needTokens: number };
+
+/**
+ * Context the session needs right now, plus headroom for the reply and the next few
+ * turns. 0 means "unknown / guard off", which skips the window check entirely.
+ */
+function contextNeed(ctx: ExtensionContext): number {
+	if (!config.contextGuard.enabled) return 0;
+	let tokens = 0;
+	let live = false;
+	try {
+		const usage = ctx.getContextUsage?.();
+		// Live usage is authoritative: it reflects compaction, unlike the sample history.
+		if (usage && typeof usage.tokens === "number" && usage.tokens > 0) {
+			tokens = usage.tokens;
+			live = true;
+		}
+	} catch {
+		/* not every mode exposes it */
+	}
+	if (!live) {
+		for (let i = samples.length - 1; i >= 0; i -= 1) {
+			if (samples[i].error) continue;
+			tokens = samples[i].promptTokens ?? 0;
+			break;
+		}
+	}
+	return tokens > 0 ? tokens + config.contextGuard.headroomTokens : 0;
+}
 
 /** Same-provider candidates, fastest first; unknown timings last. */
-async function rankCandidates(ctx: ExtensionContext): Promise<Candidate[]> {
+async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 	const provider = ctx.model?.provider;
-	if (!provider) return [];
+	if (!provider) return { candidates: [], excluded: [], needTokens: 0 };
 	const probe = await readProbe();
 	const history = await historyTtft();
 	const allowed = (id: string) =>
 		config.candidates.length === 0 || config.candidates.includes(id) || config.candidates.includes(`${provider}/${id}`);
-	const candidates: Candidate[] = ctx.modelRegistry
-		.getAvailable()
-		.filter((model) => model.provider === provider && allowed(model.id))
-		.map((model) => {
-			const probeTtft = probe?.models[model.id]?.ttft;
-			if (probe && probe.models[model.id]?.ok === false) return { id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe" as const };
-			if (typeof probeTtft === "number") return { id: model.id, ttftMs: probeTtft * 1000, source: "probe" as const };
+	const needTokens = contextNeed(ctx);
+	const currentId = ctx.model?.id;
+	const candidates: Candidate[] = [];
+	const excluded: ExcludedCandidate[] = [];
+	for (const model of ctx.modelRegistry.getAvailable()) {
+		if (model.provider !== provider || !allowed(model.id)) continue;
+		const contextWindow = typeof model.contextWindow === "number" ? model.contextWindow : undefined;
+		// Never hide the model you are already on: the session is its own problem then.
+		if (model.id !== currentId && needTokens > 0 && contextWindow !== undefined && contextWindow < needTokens) {
+			excluded.push({ id: model.id, contextWindow });
+			continue;
+		}
+		const probeTtft = probe?.models[model.id]?.ttft;
+		if (probe && probe.models[model.id]?.ok === false) candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow });
+		else if (typeof probeTtft === "number") candidates.push({ id: model.id, ttftMs: probeTtft * 1000, source: "probe", contextWindow });
+		else {
 			const hist = history.get(`${provider}/${model.id}`);
-			if (typeof hist === "number") return { id: model.id, ttftMs: hist, source: "history" as const };
-			return { id: model.id, source: "none" as const };
-		});
-	return candidates.sort((a, b) => (a.ttftMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? Number.POSITIVE_INFINITY));
+			if (typeof hist === "number") candidates.push({ id: model.id, ttftMs: hist, source: "history", contextWindow });
+			else candidates.push({ id: model.id, source: "none", contextWindow });
+		}
+	}
+	candidates.sort((a, b) => (a.ttftMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? Number.POSITIVE_INFINITY));
+	return { candidates, excluded, needTokens };
 }
+
+const describeExcluded = (excluded: ExcludedCandidate[], needTokens: number) =>
+	excluded.length === 0
+		? ""
+		: `; skipped for context: ${excluded.map((entry) => `${entry.id} (${entry.contextWindow} < ${needTokens})`).join(", ")}`;
 
 /**
  * A session is *bound* when leaving it costs more than the slowdown: the prefix cache
@@ -431,7 +495,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const ranked = await rankCandidates(ctx);
 		const currentMedian = median(streak.tail.map((s) => s.ttftMs!));
 		// A barely-faster model is not worth the prefix cache: require a clear win.
-		const best = ranked.find(
+		const best = ranked.candidates.find(
 			(candidate) =>
 				candidate.id !== current.id &&
 				candidate.ttftMs !== undefined &&
@@ -445,7 +509,8 @@ export default function modelSpeed(pi: ExtensionAPI) {
 			lastSwitchAt = Date.now();
 			await writeSwitchState({ lastSwitchAt });
 			ctx.ui.notify(
-				`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}${boundNote}), but no clearly faster same-provider model is known yet`,
+				`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}${boundNote}), but no clearly faster same-provider model is known yet` +
+					describeExcluded(ranked.excluded, ranked.needTokens),
 				"warning",
 			);
 			return;
@@ -478,15 +543,24 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		if (event.reason === "reload") return;
 
 		const ranked = await rankCandidates(ctx);
-		if (ranked.length > 1) {
-			const fastest = ranked[0];
+		if (ranked.candidates.length > 1) {
+			const fastest = ranked.candidates[0];
 			ctx.ui.setStatus("model-speed", `⚡ ${fastest.id}${fastest.ttftMs ? ` ${fmtMs(fastest.ttftMs)}` : ""}`);
 		}
 		const probe = await readProbe();
 		const current = ctx.model;
 		if (probe && current) {
 			const ageMin = probe.ts ? Math.max(0, Math.round((Date.now() / 1000 - probe.ts) / 60)) : undefined;
+			// The probe measures every model the gateway serves; only the ones this session can
+			// actually select are worth a warning.
+			const selectable = new Set(
+				ctx.modelRegistry
+					.getAvailable()
+					.filter((model) => model.provider === current.provider)
+					.map((model) => model.id),
+			);
 			const slow = Object.entries(probe.models)
+				.filter(([id]) => selectable.has(id))
 				.filter(([, value]) => value.ok === false || (value.ttft ?? 0) * 1000 > config.thresholds.ttftSmallMs)
 				.map(([id, value]) => (value.ok === false ? `${id}=failed(${value.status ?? "?"})` : `${id}=${fmtMs((value.ttft ?? 0) * 1000)}`));
 			const mine = probe.models[current.id];
@@ -503,12 +577,15 @@ export default function modelSpeed(pi: ExtensionAPI) {
 
 	// ---- commands ---------------------------------------------------------
 	const renderRanking = async (ctx: ExtensionContext) => {
-		const ranked = await rankCandidates(ctx);
+		const ranking = await rankCandidates(ctx);
 		const currentId = ctx.model?.id;
-		const lines = ranked.map(
+		const lines = ranking.candidates.map(
 			(candidate) =>
 				`${candidate.id === currentId ? "*" : " "} ${candidate.id}: ${fmtMs(candidate.ttftMs)}${candidate.source === "none" ? "" : ` (${candidate.source})`}`,
 		);
+		for (const entry of ranking.excluded) {
+			lines.push(`  ${entry.id}: skipped, context window ${entry.contextWindow} < session ${ranking.needTokens} tokens`);
+		}
 		ctx.ui.setWidget("model-speed", [`same-provider candidates (fastest first):`, ...lines.map((line) => `  ${line}`)], {
 			placement: "belowEditor",
 		});
