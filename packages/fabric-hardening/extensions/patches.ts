@@ -14,7 +14,7 @@
  * patch keyed to a filename silently stops applying after an upgrade. Discovery walks
  * the declared roots and applies to every file that contains the upstream text.
  */
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
 
@@ -189,6 +189,71 @@ export const PATCHES: Patch[] = [
 			"  }",
 		].join("\n"),
 	},
+	// --- pi-grow-loop: a fabric child must not schedule its own continuation ----
+	// 2026-11-17: fabric.json 的 agents.extensions 默认 true ⇒ 每个子代理都加载所有用户包，
+	// 包括 @llblab/pi-grow-loop ⇒ 子代理可以调 grow_loop 排下一轮。子代理是一次性 worker：
+	// 它汇报「阶段完成」后继续自跑，而 Fabric 只在 agent_settled/进程退出时才认终态，
+	// 于是父代理的 agents.wait 一直被卡到超时，用户也看不出「阶段性完成」到底是等确认还是还在跑。
+	{
+		id: "grow-loop-child-guard",
+		packageName: "@llblab/pi-grow-loop",
+		roots: ["dist"],
+		marker: "[pi-fabric-hardening:grow-loop-child-guard]",
+		label: "pi-grow-loop: grow_loop refuses to schedule inside a fabric child",
+		original: [
+			"        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {",
+			"            lastCtx = ctx;",
+		].join("\n"),
+		patched: [
+			"        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {",
+			"            // [pi-fabric-hardening:grow-loop-child-guard] Continuation belongs to the parent.",
+			"            // A looping child never reaches a terminal state Fabric can see, so the parent's",
+			"            // agents.wait blocks until timeout while the child reports checkpoints.",
+			"            const fabricDepth = Number(process.env.PI_FABRIC_DEPTH ?? \"\");",
+			"            const inFabricChild = (Number.isFinite(fabricDepth) && fabricDepth >= 1) ||",
+			"                Boolean(process.env.PI_FABRIC_AGENT_NAME) ||",
+			"                process.env.PI_NO_GROW_LOOP === \"1\";",
+			"            if (inFabricChild) {",
+			"                return {",
+			"                    isError: true,",
+			"                    content: [{",
+			"                        type: \"text\",",
+			"                        text: \"grow_loop is unavailable inside a fabric child (PI_FABRIC_DEPTH=\" + (process.env.PI_FABRIC_DEPTH ?? \"?\") + \"). A child is a one-shot worker: finish this turn, report 完成 with evidence, and let the parent schedule continuation. Do not claim the task will continue by itself.\",",
+			"                    }],",
+			"                    details: { disabled: \"fabric-child\" },",
+			"                };",
+			"            }",
+			"            lastCtx = ctx;",
+		].join("\n"),
+	},
+	// --- pi-grow-loop: make the loop state visible in the transcript ------------
+	{
+		id: "grow-loop-state-visible",
+		packageName: "@llblab/pi-grow-loop",
+		roots: ["dist"],
+		marker: "[pi-fabric-hardening:grow-loop-state-visible]",
+		label: "pi-grow-loop: every checkpoint states 续轮/结束 explicitly (visible to user + parent)",
+		original: [
+			'                            ? `\\nTool grow_loop was already called this turn. Iteration #${nextIteration} remains scheduled; delay updated to ${delayMs / 1000}s`',
+			'                            : `\\nGrow Loop iteration #${nextIteration} deferred until idle, then scheduled after ${delayMs / 1000}s delay`,',
+		].join("\n"),
+		patched: [
+			'                            ? `⟳ grow-loop 续轮 #${nextIteration}（本轮不是最终完成；延时已改为 ${delayMs / 1000}s，之后继续）` // [pi-fabric-hardening:grow-loop-state-visible]',
+			'                            : `⟳ grow-loop 续轮 #${nextIteration}（本轮不是最终完成；${delayMs / 1000}s 后继续）`,',
+		].join("\n"),
+	},
+	{
+		id: "grow-loop-state-guideline",
+		packageName: "@llblab/pi-grow-loop",
+		roots: ["dist"],
+		marker: "[pi-fabric-hardening:grow-loop-state-guideline]",
+		label: "pi-grow-loop: prompt guideline demands an explicit ⟳ 续轮 / ■ 结束 marker",
+		original: '            "To stop, do not call grow_loop; finish with a concise stop proof.",',
+		patched: [
+			'            "To stop, do not call grow_loop; finish with a concise stop proof.",',
+			'            "Always state the loop state explicitly in your final message for the turn: `⟳ 续轮 #N（Ns 后继续）` when you scheduled one, `■ 结束` when you stopped. Never leave continuation implicit — a checkpoint that will continue looks identical to a finished task otherwise.", // [pi-fabric-hardening:grow-loop-state-guideline]',
+		].join("\n"),
+	},
 ];
 
 const MAX_PATCHABLE_FILE_BYTES = 8 * 1024 * 1024;
@@ -281,8 +346,12 @@ export function applyPatches(options: ApplyOptions = {}): ApplyReport {
 			}
 			if (!content.includes(patch.original)) continue;
 			if (write) {
+				// Replace through a temp file: an interrupted write (crash, ENOSPC) must
+				// never leave a half-written chunk that breaks the next Pi start.
+				const temporary = `${file}.hardening-${process.pid}`;
 				try {
-					writeFileSync(file, content.replace(patch.original, patch.patched));
+					writeFileSync(temporary, content.replace(patch.original, patch.patched));
+					renameSync(temporary, file);
 				} catch {
 					unexpected += 1;
 					continue;

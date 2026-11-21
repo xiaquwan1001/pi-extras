@@ -28,6 +28,9 @@ Every fix here comes from a real incident where Fabric's failure mode was worse 
 | `error-ordering` | pi-fabric | "was killed by SIGSEGV" comes first, `stderr` becomes `; last stderr: …` |
 | `tolerate-same-provider-model-drift` | pi-fabric | a child served by another model of the **same** provider logs the drift and keeps running; another *provider*, or a missing attribution, is still fatal |
 | `evidence-no-session-guard` | pi-fold | skip evidence archiving when there is no session file instead of throwing |
+| `grow-loop-child-guard` | @llblab/pi-grow-loop | `grow_loop` refuses inside a Fabric child (`PI_FABRIC_DEPTH>=1`); a looping child never reaches a terminal state the parent can see, so `agents.wait` blocked to timeout |
+| `grow-loop-state-visible` | @llblab/pi-grow-loop | the tool result says `⟳ 续轮 #N` instead of an ambiguous "scheduled" sentence |
+| `grow-loop-state-guideline` | @llblab/pi-grow-loop | the prompt guideline requires an explicit `⟳ 续轮` / `■ 结束` marker |
 
 Plus one patch-free fix: **TMPDIR relocation**. When `/tmp` is a tmpfs with less than `PI_FABRIC_TMPDIR_MIN_FREE_MB` (default 4096) MB free, `TMPDIR` is pointed at `~/.cache/pi-tmp` before Fabric creates its run roots. A real disk is left alone.
 
@@ -37,6 +40,7 @@ Plus one patch-free fix: **TMPDIR relocation**. When `/tmp` is a tmpfs with less
 - **Found by content, not filename.** pi-fabric's compiled chunks are renamed on every release (`chunk-QUWC6YCN.js` today, something else tomorrow), so patches search the declared roots and apply to every file containing the upstream text — including the two chunk files that each define `RETRYABLE_RENAME_CODES`.
 - **Fails soft.** Package missing (`pi-fabric` not installed), file missing, or upstream text changed: the patch is skipped and reported. Nothing throws, nothing blocks startup.
 - **No forking, no bundling.** Patches are text substitutions against the installed package; the extension has no dependency on pi-fabric.
+- **Atomic writes.** A patched file is written to a temp name and renamed into place, so an interrupted write can never leave a half-written chunk behind.
 
 ## Install
 
