@@ -1,0 +1,1019 @@
+From a07dbd47d68ed99e6336051c812a6aea14b9511d Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Mon, 16 Nov 2026 23:24:04 +0800
+Subject: [PATCH 1/5] agents.resume: continue a child from its own session
+ transcript (agents.childSession)
+
+Give every Pi child a Fabric-owned session file in its run directory so a
+terminal run can be continued from the transcript it wrote, instead of
+restarting from a text summary. The host records the exact launch beside the
+run as the only thing a resume may re-execute; three manual resumes bound one
+run. A resumed attempt runs on the plain pi runner, because pi-durable answers
+from the result it recorded for the stored prompt.
+
+Co-Authored-By: AI assistant
+---
+ docs/agents.md                         |  17 ++
+ docs/configuration.md                  |   2 +
+ scripts/manual-resume-e2e.ts           |  51 ++++++
+ src/agents/manager.ts                  | 225 ++++++++++++++++++++++++-
+ src/agents/resume.ts                   | 163 ++++++++++++++++++
+ src/audit/projection.ts                |   1 +
+ src/config.ts                          |  11 ++
+ src/durable/worker-role-seed.ts        |   7 +-
+ src/providers/agents-actions.ts        |  21 +++
+ src/providers/agents-provider.ts       |  17 ++
+ src/runtime/guest-types.ts             |   8 +-
+ src/runtime/quickjs-runtime.ts         |   1 +
+ tests/agent-resume.test.ts             | 121 +++++++++++++
+ tests/fixtures/fake-pi-rpc-session.mjs | 107 ++++++++++++
+ 14 files changed, 746 insertions(+), 6 deletions(-)
+ create mode 100644 scripts/manual-resume-e2e.ts
+ create mode 100644 src/agents/resume.ts
+ create mode 100644 tests/agent-resume.test.ts
+ create mode 100755 tests/fixtures/fake-pi-rpc-session.mjs
+
+diff --git a/docs/agents.md b/docs/agents.md
+index 9dffeaa..27c7a94 100644
+--- a/docs/agents.md
++++ b/docs/agents.md
+@@ -580,6 +580,23 @@ localterm start
+ 
+ `/fabric agents` lists the children. Run `/fabric attach <id>` to show the correct attach command. A caller abort stops a run that never produced progress and detaches a run that already did: the child keeps working to its own terminal state and reports it, so a returned program or a cancelled tool call cannot discard a long participant's work. A worker that catches an external signal mid-run, or whose transport dies after doing work, is resumed, so an interruption the run can recover from never becomes a terminal stop. The manager relaunches the same run in the same directory, hands the child a continuation of the task, keeps the stopped attempt's turns and token usage in the run record, and emits `run.resumed`. An explicit stop, a run deadline, and the `agents.maxTokensPerChild` limit stay terminal. Three resumes bound one run, and the run deadline covers every attempt. When a program uses orchestration entry points such as `agent`/`workflow.agent`, `agents.run`/`agents.wait`/`agents.ask`, `council.run`, or `rlm.query`, Fabric increases the whole-program `executor.timeoutMs` to at least `agents.timeoutMs`. The same increase applies to `agents.*` refs called through `tools.call()` and to refs calculated at runtime. The parent deadline then cannot stop a child that remains within its own agent budget.
+ 
++##### Resume a child from its own transcript
++
++The automatic resume above only rewrites the task, because by default a child holds no conversation of its own (`--no-session`): the relaunched child re-derives everything from the note and the working tree. Set [`agents.childSession: true`](configuration.md#agents) to give every Pi child a private session file in its run directory, and the child's own transcript survives its run. A program then continues that exact child after it settled:
++
++```ts
++const handle = await agents.spawn({ task: "Migrate the lane and land the tests" });
++const stopped = await agents.wait(handle.id);          // stopped, failed, timed_out, or completed
++if (stopped.status !== "completed") {
++  const resumed = await agents.resume({ id: handle.id, task: "finish the failing test first" });
++  const result = await agents.wait({ id: resumed.id });
++}
++```
++
++`agents.resume` reopens the child's session file with the same run id, run directory, cwd, tools, and model, so the child sees the turns it already made and does not redo finished work. It receives a short continuation note naming how the previous attempt ended, plus its original task and your optional extra `task` as fresh instruction. The run keeps its identity: usage and turn counts carry over, a fresh `timeoutMs` starts counting, and `run.resumed` reports the attempt. A resumed run is a live run again — `agents.wait`, `status`, `steer`, and `followUp` behave as for any other run, and a detached resumed run notifies its completion like any detached one.
++
++The limits are deliberate. Only a run that has settled is resumed (a live run takes `steer`/`followUp` instead), only Fabric's own Pi runners qualify, and only the launch the host recorded for that run is ever re-executed: the record beside the run (`resume.json`) is written by the host and re-validated against this host's worker entry, run directory, and cwd, so nothing outside the run directory can point a resume at another program. Three manual resumes bound one run, and the manual count shares the automatic budget. `agents.cleanup` and run retention remove the record with the run, and the run root is deleted when a session closes unless `agents.retainRuns` is on, so resume continues a run this session still owns; a run from an earlier session is continued with [`residency: "durable"`](durable-pi.md) plus `agents.durableWorkerRecovery` instead. A child launched before the setting was enabled has no session to reopen, and `agents.resume` names that reason.
++
+ Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-<id8>` branch from the repository containing the selected `cwd`. Fabric writes that worktree at `<repo>/.pi/fabric/worktrees/<id>` so copy-on-write cloning can keep ignored build artifacts on the same volume, and it records the path in the repository `.git/info/exclude` file. Configure `agents.worktree.root` (relative to the selected Git root) and `agents.worktree.branch` (tokens `{name}`, `{id}`, `{id8}`) to override these defaults; for example, `{ "root": ".worktrees", "branch": "issue/{name}-{id}" }`. Cleanup uses the creation-time path and branch, including for durable agents after config changes. Simple `git worktree add` commands run through `pi.bash` take the same clone-first path. Fabric retains worktrees for inspection until you call `agents.cleanup()`. When the selected cwd is a repository subdirectory, Fabric uses the matching subdirectory in the generated worktree when it exists; otherwise it uses the worktree root. The reported effective cwd is the generated worktree path, and Pi evaluates that generated path as its own canonical cwd. The caller's project and mesh roots remain unchanged, so a child targeting another repository still belongs to the orchestrating Fabric topology. A recursive child in a worktree stays in the same participant directory and does not create another `.pi/fabric/mesh` inside that worktree.
+ 
+ At settlement, a `worktree: true` result and status carry `worktreeResult: { path, branch?, baseRef?, changedFiles, diffstat: { files, insertions, deletions }, kept, diffError? }` beside the existing `worktree` path string. `baseRef` is the commit the branch started from. `changedFiles` is the sorted union of tracked changes against `baseRef` (committed or not) and untracked, non-ignored files, capped at 500 entries; `diffstat.files` counts all of them. Untracked text files up to 1 MiB count their lines as insertions. Fabric computes the summary with two bounded Git calls (15 second timeout each); a Git failure leaves the counts at zero and sets `diffError`. `kept` reports whether the worktree still exists; worktrees stay until `agents.cleanup()`.
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 1b86776..359a430 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -178,6 +178,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs`
+     "retainRuns": false,
+     "durableWorkerRecovery": false,
+     "durableWorkerSession": false,
++    "childSession": false,
+     "notifyOnComplete": true,
+     "budgetUsd": 0,
+     "maxTokensPerChild": 0,
+@@ -697,6 +698,7 @@ Other agent settings:
+ - `maxTokensPerChild`: cumulative token bound per child (0 disables).
+ - `durableWorkerRecovery` (default `false`): let a restarted resident host re-attach, or relaunch on its journal, an unfinished `pi-durable` run launched with `residency: "durable"` on the `process` transport. A run it cannot recover settles with `outcome: "indeterminate"`. See [durable-pi.md](durable-pi.md#opt-in-reattach-after-a-resident-host-restart).
+ - `durableWorkerSession` (default `false`): give a `pi-durable` child without a seeded session a private Pi session file in its run directory, and put a worker-role entry at the root of its session (fork and handoff seeds too). A relaunch then keeps what extensions saved in the session. With it off, the child runs with `--no-session` as before. See [durable-pi.md](durable-pi.md#opt-in-a-session-file-for-pi-durable-workers).
++- `childSession` (default `false`): give every Pi child a private Pi session file inside its run directory (a seeded child already runs inside its seed), so a child that stopped, failed, timed out, or finished can be continued from its own transcript with [`agents.resume`](agents.md#resume-a-child-from-its-own-transcript). The host writes the file and records the exact launch beside it as the only thing a resume may re-execute. A run launched while this setting was off has no resume record, and `agents.resume` says so. Children still keep no session in Pi's own store, so trackers see them only through `sessionExport`.
+ - `notifyOnComplete`: show concise detached `agents.spawn()` completion notices and batch unread results for Main at a safe tool-turn boundary (or wake idle Main). `wait`/`join` and terminal `status` retract pending notifications; running/UI status does not. Escape/error parks results until new input.
+ - `sessionExport`: export each agent run's usage as an attributed pi-format session file (on by default).
+ - `sessionExportDir`: override the export store root (default `~/.pi-fabric/agent`, with `PI_FABRIC_AGENT_DIR` taking precedence).
+diff --git a/scripts/manual-resume-e2e.ts b/scripts/manual-resume-e2e.ts
+new file mode 100644
+index 0000000..febcaf3
+--- /dev/null
++++ b/scripts/manual-resume-e2e.ts
+@@ -0,0 +1,51 @@
++// Manual end-to-end check: a real Pi child, resumed from its own session file.
++// Run with: PI_FABRIC_NODE_BINARY=$PWD/node_modules/.bin/bun node_modules/.bin/bun scripts/manual-resume-e2e.ts <provider/model>
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
++import { AgentManager } from "../src/agents/manager.js";
++import { readRunResume } from "../src/agents/resume.js";
++
++const model = process.argv[2] || "custom.ustc-pool/ustc-dsf";
++const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-resume-e2e-")));
++const manager = new AgentManager(process.cwd(), {
++  ...DEFAULT_FABRIC_CONFIG.agents,
++  runner: "pi", // from the source tree only the plain runner can launch; the shipped pi-durable default is covered by the live `agents.resume` smoke
++  retainRuns: true,
++  childSession: true,
++  timeoutMs: 180_000,
++  thinking: "off",
++  extensions: true,
++}, { runRoot: root, fullCodeMode: false });
++
++const TOKEN = "ZEBRA-77";
++try {
++  const handle = await manager.spawn({
++    task: `Remember this token for later: ${TOKEN}. Acknowledge with the single word OK. Do not use any tool.`,
++    transport: "process",
++    model,
++    tools: ["read"],
++    timeoutMs: undefined,
++  });
++  console.log("spawned", handle.id, handle.model ?? model);
++  const first = await manager.wait(handle.id);
++  console.log("attempt 1:", first.status, JSON.stringify(first.text.slice(0, 200)));
++  const runDirectory = manager.runDirectory(handle.id);
++  const sessionFile = path.join(String(runDirectory), "child-session", "session.jsonl");
++  console.log("session file:", fs.existsSync(sessionFile) ? `${sessionFile} (${fs.statSync(sessionFile).size} bytes)` : "MISSING");
++  console.log("resume record:", JSON.stringify(readRunResume(String(runDirectory))?.sessionFile));
++  if (first.status !== "completed") throw new Error("first attempt did not complete");
++
++  const resumed = await manager.resume(handle.id, `Question to answer from your own earlier turns in this session (do not use tools, ignore the earlier acknowledgment instruction): which token was you given earlier? Answer with just the token.`);
++  console.log("resumed:", resumed.status, "attempt counter:", readRunResume(String(runDirectory))?.attempts);
++  const second = await manager.wait(handle.id);
++  console.log("attempt 2:", second.status, JSON.stringify(second.text.slice(0, 300)));
++  console.log("session file after:", `${fs.statSync(sessionFile).size} bytes`);
++  const carried = second.status === "completed" && second.text.includes(TOKEN);
++  console.log(carried ? "PASS: the resumed child still knew the token from its own transcript"
++    : `FAIL: token not carried (status ${second.status})`);
++} finally {
++  await manager.close();
++  fs.rmSync(root, { recursive: true, force: true });
++}
+diff --git a/src/agents/manager.ts b/src/agents/manager.ts
+index dc81fe7..eceea50 100644
+--- a/src/agents/manager.ts
++++ b/src/agents/manager.ts
+@@ -147,6 +147,18 @@ import {
+   AGENT_STARTUP_RETRY_BASE_DELAY_MS,
+   AGENT_STATUS_POLL_INTERVAL_MS,
+ } from "./constants.js";
++import { createDurableSessionFile } from "../durable/worker-role-seed.js";
++import {
++  MAX_MANUAL_RESUMES,
++  RESUME_FORMAT,
++  readRunResume,
++  runResumeMismatch,
++  writeRunResume,
++} from "./resume.js";
++
++/** Folder inside a run directory that holds a resumable child's session file. */
++const CHILD_SESSION_FOLDER = "child-session";
++
+ const NESTED_SNAPSHOT_POLL_MS = 500;
+ const TRANSPORT_EXIT_GRACE_MS = 1_000;
+ // agents.childQuestionTimeoutMs default: routed child dialogs cancel after 10 minutes.
+@@ -262,6 +274,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+   capabilityRequirements?: string[];
+   capabilityDigest?: string;
+   runnerSessionId?: string;
++  /** Fabric-owned child session file (agents.childSession) that agents.resume reopens. */
++  childSessionFile?: string;
+   branch?: string;
+   worktree?: string;
+   worktreeResult?: AgentWorktreeResult;
+@@ -405,6 +419,28 @@ const resumeTask = (
+   return `${note.slice(0, MAX_RESUME_NOTE_CHARS)}\n\n${task}`;
+ };
+ 
++/**
++ * Task a manually resumed child receives. Unlike `resumeTask`, this child
++ * reopens its own transcript, so the note speaks to a child that remembers its
++ * previous attempt, and it carries the coordinator's fresh instruction.
++ */
++const continuationTask = (
++  task: string,
++  record: AgentRunRecord,
++  runDirectory: string,
++  instruction?: string,
++): string => {
++  const summary = summarizeRunLog(runDirectory, 6);
++  const note = [
++    "[Fabric continuation] Your previous attempt at this exact task stopped before it finished.",
++    `It ended with status "${record.status}"${record.error ? ` (${record.error})` : ""} after ${record.turns} turns and ${record.toolCalls} tool calls; your earlier turns are in this session, and the working tree already contains what that attempt completed.`,
++    "Inspect the current state first, do not redo work that is already done, and carry the task through to completion.",
++    ...(summary ? [`Last observed run activity: ${summary}`] : []),
++    ...(instruction?.trim() ? [`Your coordinator adds: ${instruction.trim().slice(0, MAX_RESUME_NOTE_CHARS)}`] : []),
++  ].join(" ");
++  return `${note.slice(0, MAX_RESUME_NOTE_CHARS * 2)}\n\n${task}`;
++};
++
+ const retryablePiStartupError = (error: string | undefined): boolean =>
+   typeof error === "string" &&
+   /\b(?:no|missing)\s+(?:api key|credentials?)\b|\b(?:api key|credentials?)\s+(?:was\s+)?not found\b/i.test(
+@@ -1137,6 +1173,11 @@ export class AgentManager {
+     const runDirectory = path.join(this.#runRoot, id);
+     // Opt-in (agents.durableWorkerSession): a pi-durable child keeps a session file with a worker-role entry.
+     const durableSession = runner === "pi-durable" && this.config.durableWorkerSession === true;
++    // Opt-in (agents.childSession): keep a private Pi session file so a terminal
++    // run can be continued from its own transcript instead of a text summary.
++    const childSession = !durableSession && this.config.childSession === true &&
++      (runner === "pi" || runner === "pi-durable");
++    const privateRunDirectory = durableSession || childSession;
+     const taskFile = path.join(runDirectory, "task.txt");
+     const statusFile = path.join(runDirectory, "status.json");
+     const lifecycleFile = path.join(runDirectory, "lifecycle.jsonl");
+@@ -1147,8 +1188,9 @@ export class AgentManager {
+       ? path.join(runDirectory, "images.json")
+       : undefined;
+     try {
+-      // With a durable session, 0700: the pi-durable worker refuses a run directory that group or others can write.
+-      fs.mkdirSync(runDirectory, durableSession ? { recursive: true, mode: 0o700 } : { recursive: true });
++      // With a durable or resumable session, 0700: the session-file writer refuses a
++      // run directory that group or others can write.
++      fs.mkdirSync(runDirectory, privateRunDirectory ? { recursive: true, mode: 0o700 } : { recursive: true });
+       fs.writeFileSync(taskFile, request.task, { encoding: "utf8", mode: 0o600 });
+       if (imagesFile) {
+         fs.writeFileSync(imagesFile, JSON.stringify(request.images), {
+@@ -1227,6 +1269,18 @@ export class AgentManager {
+             seedOptions,
+           )
+         : request.sessionFile;
++      // Opt-in (agents.childSession): give a Pi child a private session file in its
++      // run directory so a terminal run keeps its own transcript, which
++      // agents.resume reopens instead of restarting the task from a text summary.
++      // A seeded run (fork/handoff) already runs inside its seed file and resumes there.
++      const childSessionFile = childSession && sessionFile === undefined
++        ? createDurableSessionFile(runDirectory, agentCwd, {}, CHILD_SESSION_FOLDER)
++        : undefined;
++      const launchSessionFile = sessionFile ?? childSessionFile;
++      // A pi-durable child with agents.durableWorkerSession gets its session file
++      // from the worker at a path this host can name, so it is resumable too.
++      const resumableSessionFile = launchSessionFile
++        ?? (durableSession ? path.join(runDirectory, "durable-session", "session.jsonl") : undefined);
+       const timeoutMs = effectiveAgentTimeoutMs(
+         this.config.timeoutMs,
+         request.timeoutMs,
+@@ -1373,7 +1427,7 @@ export class AgentManager {
+         // An exact request is always strict: permissive admission accepts another model.
+         request.modelMatch === "exact" ? "strict" : this.config.modelAdmission ?? "strict",
+         ...(request.modelMatch === "exact" ? ["--model-match", "exact"] : []),
+-        ...(sessionFile ? ["--session-file", sessionFile] : []),
++        ...(launchSessionFile ? ["--session-file", launchSessionFile] : []),
+         ...(sessionExportFile ? ["--session-export-file", sessionExportFile] : []),
+         ...(inheritedSessionPins && inheritedSessionPins.length > 0
+           ? ["--inherited-session-pins", serializeInheritedSessionPins(inheritedSessionPins)]
+@@ -1475,6 +1529,7 @@ export class AgentManager {
+         lifecycleOffset: 0,
+         lifecycleRemainder: Buffer.alloc(0),
+         runDirectory,
++        ...(resumableSessionFile ? { childSessionFile: resumableSessionFile } : {}),
+         transport,
+         adapter,
+         launch,
+@@ -1515,6 +1570,11 @@ export class AgentManager {
+       }
+       this.#runs.set(id, managed);
+       this.#unregisteredTransports.delete(transport);
++      // A run that lives inside a session file records the exact launch a manual
++      // resume needs. Only this host's own launch is ever re-executed.
++      if (resumableSessionFile && (runner === "pi" || runner === "pi-durable")) {
++        this.#persistRunResume(managed, resumableSessionFile, timeoutMs);
++      }
+       if (recoveryPolicy !== undefined) {
+         managed.workerRecovery = { deadlineAt: Date.now() + timeoutMs, policy: recoveryPolicy };
+         this.#persistWorkerRecovery(managed);
+@@ -1984,6 +2044,165 @@ export class AgentManager {
+     await this.#requireHosted(id, "sleep").park("wake");
+   }
+ 
++  /**
++   * Record the launch a manual resume of this run must re-execute. Written only
++   * for a run that lives inside a session file, beside the run it describes.
++   */
++  #persistRunResume(managed: ManagedAgent, sessionFile: string, timeoutMs: number): void {
++    try {
++      writeRunResume(managed.runDirectory, {
++        format: RESUME_FORMAT,
++        id: managed.id,
++        cwd: managed.cwd,
++        task: managed.task,
++        sessionFile,
++        launch: { ...managed.launch, workerArguments: [...managed.launch.workerArguments] },
++        deadlineAt: Date.now() + timeoutMs,
++        attempts: 0,
++        writtenAt: Date.now(),
++      });
++    } catch {
++      // A run whose resume record cannot be written is simply not resumable.
++    }
++  }
++
++  /** Whether a child session file holds an actual transcript to continue from. */
++  #sessionHasTranscript(sessionFile: string): boolean {
++    try {
++      const size = fs.statSync(sessionFile).size;
++      const handle = fs.openSync(sessionFile, "r");
++      try {
++        const from = Math.max(0, size - 65_536);
++        const buffer = Buffer.alloc(Math.min(size, 65_536));
++        fs.readSync(handle, buffer, 0, buffer.length, from);
++        return buffer.toString("utf8").includes('"role"');
++      } finally {
++        fs.closeSync(handle);
++      }
++    } catch {
++      return false;
++    }
++  }
++
++  /**
++   * Continue a terminal child run from the session transcript it wrote
++   * (`agents.childSession`). The run keeps its identity — same id, run directory,
++   * cwd and launch — and the child reopens its own session file, so the work an
++   * interrupted attempt finished is carried instead of re-derived from a text
++   * summary. Only the launch this host recorded for this run is ever re-executed,
++   * and `MAX_MANUAL_RESUMES` bounds how often one run may be revived.
++   */
++  async resume(id: string, instruction?: string, timeoutMs?: number): Promise<AgentHandleInfo> {
++    const managed = this.#requireRun(id);
++    if (managed.hosted) {
++      throw new Error(`Fabric agent ${id} is a hosted run; its own runner owns its continuation`);
++    }
++    if (managed.runner !== "pi" && managed.runner !== "pi-durable") {
++      throw new Error(`Fabric agent ${id} runs on ${managed.runner}, which has no Fabric-owned session to resume`);
++    }
++    if (!managed.settled) throw new Error(`Fabric agent ${id} is still running; steer it or wait for it`);
++    const record = this.#readManagedRecord(managed) ?? readRecord(managed.statusFile);
++    if (!record || !terminalStatuses.has(record.status)) {
++      throw new Error(`Fabric agent ${id} has no terminal result to continue from`);
++    }
++    const authority = readRunResume(managed.runDirectory);
++    if (!authority) {
++      throw new Error(
++        `Fabric agent ${id} has no resume record: it was launched before agents.childSession was enabled, ` +
++        "or its run files were cleaned up. Enable agents.childSession and dispatch a new run to make children resumable.",
++      );
++    }
++    if (authority.attempts >= MAX_MANUAL_RESUMES) {
++      throw new Error(`Fabric agent ${id} already spent its ${MAX_MANUAL_RESUMES} manual resumes`);
++    }
++    const mismatch = runResumeMismatch(authority, {
++      runDirectory: managed.runDirectory,
++      workerPath: this.#workerPath,
++      cwd: managed.cwd,
++      ...(managed.childSessionFile ? { sessionFile: managed.childSessionFile } : {}),
++    });
++    if (mismatch) throw new Error(`Fabric agent ${id} cannot be resumed: ${mismatch}`);
++    if (!this.#sessionHasTranscript(authority.sessionFile)) {
++      throw new Error(`Fabric agent ${id} cannot be resumed: its session file holds no turns to continue`);
++    }
++    if (!fs.existsSync(managed.cwd)) {
++      throw new Error(`Fabric agent ${id} cannot be resumed: its working directory ${managed.cwd} no longer exists`);
++    }
++    if (this.#budget) {
++      const spent = readBudgetLedger(this.#budget.file).cost;
++      if (!budgetAdmits(spent, this.#budget.budget)) {
++        throw new Error(
++          `Fabric recursion budget exceeded: spent $${spent.toFixed(6)} of $${this.#budget.budget.toFixed(6)}. ` +
++          "Increase agents.budgetUsd or simplify the task.",
++        );
++      }
++    }
++    const release = await this.#semaphore.acquire("native");
++    if (this.#closing) {
++      release();
++      throw new Error("Fabric agent manager is closing");
++    }
++    this.#semaphore.admit(this.#currentDepth + 1);
++    const resumeTimeoutMs = effectiveAgentTimeoutMs(this.config.timeoutMs, timeoutMs);
++    const task = authority.task || managed.task;
++    const { turns, toolCalls, usage } = managed.observedProgress;
++    managed.task = task;
++    managed.childSessionFile = authority.sessionFile;
++    managed.resumeAttempts = authority.attempts + 1;
++    managed.stopRequested = false;
++    managed.background = true;
++    managed.completionNotified = false;
++    // Re-open the run handle: the resumed attempt settles on its own terms, and
++    // its permit returns to the admission semaphore when it does.
++    Object.assign(managed, createAgentLifecycle<AgentRunResult>(release));
++    // A continuation is a fresh prompt in the same session. The durable runner
++    // answers with the result it already recorded for the prompt it stored, so a
++    // resumed run continues on the plain Pi runner instead: same session file,
++    // cwd, model and tools, without the recorded-result replay.
++    if (managed.runner === "pi-durable") {
++      const workerArguments = [...managed.launch.workerArguments];
++      const runnerIndex = workerArguments.indexOf("--runner");
++      if (runnerIndex < 0) workerArguments.push("--runner", "pi");
++      else workerArguments[runnerIndex + 1] = "pi";
++      const durableIndex = workerArguments.indexOf("--durable-session");
++      if (durableIndex >= 0) workerArguments.splice(durableIndex, 2);
++      // Its session file is normally created by the worker; name it explicitly so
++      // the plain Pi runner reopens the transcript the durable attempt wrote.
++      setWorkerArgument(workerArguments, "session-file", authority.sessionFile);
++      managed.launch = { ...managed.launch, workerArguments };
++      managed.runner = "pi";
++      const piAdapter = getAgentRunner("pi");
++      if (piAdapter) managed.runnerAdapter = piAdapter;
++      // A durable recovery receipt describes the launch it was written for.
++      if (managed.workerRecovery) {
++        removeWorkerRecovery(managed.runDirectory);
++        delete managed.workerRecovery;
++      }
++    }
++    const relaunched = await this.#relaunch(managed, record, {
++      task: continuationTask(task, record, managed.runDirectory, instruction),
++      carryOver: { turns, toolCalls, usage: { ...usage } },
++    });
++    if (!relaunched) {
++      const failed = readRecord(managed.statusFile) ?? record;
++      this.#settle(managed, this.#withTransportMetadata(failed, managed) as AgentRunResult);
++      throw new Error(
++        `Fabric agent ${id} did not restart: ${failed.error ?? "the resumed attempt failed to launch"}`,
++      );
++    }
++    writeRunResume(managed.runDirectory, {
++      ...authority,
++      task,
++      launch: { ...managed.launch, workerArguments: [...managed.launch.workerArguments] },
++      attempts: authority.attempts + 1,
++      deadlineAt: Date.now() + resumeTimeoutMs,
++      writtenAt: Date.now(),
++    });
++    this.#invalidateUiList();
++    void this.#monitor(managed, resumeTimeoutMs);
++    return this.#handleInfo(managed, "running");
++  }
++
+   #requireHosted(id: string, capability: "sleep"): HostedRun {
+     const managed = this.#requireRun(id);
+     if (!managed.hosted) throw new Error(`The ${managed.runnerAdapter.label} runner does not support ${capability}`);
+diff --git a/src/agents/resume.ts b/src/agents/resume.ts
+new file mode 100644
+index 0000000..74584e2
+--- /dev/null
++++ b/src/agents/resume.ts
+@@ -0,0 +1,163 @@
++import fs from "node:fs";
++import path from "node:path";
++import type { AgentTransportLaunch } from "./types.js";
++
++/**
++ * Resume authority for a run whose child kept its own Pi session file
++ * (`agents.childSession`).
++ *
++ * `agents.resume` relaunches the run's worker, so it needs the exact launch the
++ * original attempt used. Worker-written status is telemetry, never authority: a
++ * process running as this user could otherwise point a relaunch at another
++ * program, directory, or run id. This record is written by the host that spawned
++ * the run, beside the run it describes, and re-read with every field checked
++ * against this manager's own worker entry, run root, and cwd — the same shape of
++ * check `worker-recovery.ts` applies to an interrupted durable worker.
++ *
++ * The file exists only for runs launched with `agents.childSession`, and it is
++ * removed with the run directory (`agents.cleanup`, run retention).
++ */
++export const RESUME_FILE = "resume.json";
++export const RESUME_FORMAT = 1;
++/** Manual resumes one run may be granted before Fabric refuses. */
++export const MAX_MANUAL_RESUMES = 3;
++/** Larger files are refused unread: a launch is far smaller than this. */
++export const RESUME_MAX_BYTES = 256 * 1024;
++
++export interface RunResumeRecord {
++  format: typeof RESUME_FORMAT;
++  id: string;
++  cwd: string;
++  task: string;
++  /** Fabric-owned Pi session file the child ran inside; resume reopens it. */
++  sessionFile: string;
++  launch: AgentTransportLaunch;
++  /** Wall-clock deadline the original attempt was given; a resume gets a fresh one. */
++  deadlineAt: number;
++  /** Manual resumes granted so far. */
++  attempts: number;
++  writtenAt: number;
++}
++
++export const resumePath = (runDirectory: string): string => path.join(runDirectory, RESUME_FILE);
++
++export const writeRunResume = (runDirectory: string, record: RunResumeRecord): void => {
++  fs.mkdirSync(path.dirname(resumePath(runDirectory)), { recursive: true, mode: 0o700 });
++  fs.writeFileSync(resumePath(runDirectory), JSON.stringify(record, null, 2), {
++    encoding: "utf8",
++    mode: 0o600,
++  });
++};
++
++export const removeRunResume = (runDirectory: string): void => {
++  try {
++    fs.rmSync(resumePath(runDirectory), { force: true });
++  } catch {
++    // A run directory this host cannot write has nothing left to resume.
++  }
++};
++
++const readLaunch = (value: unknown): AgentTransportLaunch | undefined => {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
++  const launch = value as Partial<AgentTransportLaunch>;
++  if (typeof launch.id !== "string" || typeof launch.name !== "string"
++    || typeof launch.cwd !== "string" || typeof launch.workerPath !== "string"
++    || !Array.isArray(launch.workerArguments)
++    || launch.workerArguments.some((argument) => typeof argument !== "string")) return undefined;
++  return {
++    id: launch.id,
++    name: launch.name,
++    cwd: launch.cwd,
++    workerPath: launch.workerPath,
++    workerArguments: [...launch.workerArguments],
++  };
++};
++
++/**
++ * Strict reader: copies named, validated fields and refuses anything else. The
++ * record's id must name the run directory it sits in, so a file copied from
++ * another run is never read as this one. Returns undefined for a missing,
++ * oversized, or malformed file — an unreadable marker is never launch authority.
++ */
++export const readRunResume = (runDirectory: string): RunResumeRecord | undefined => {
++  const file = resumePath(runDirectory);
++  let size: number;
++  try {
++    const stat = fs.lstatSync(file);
++    if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
++    size = stat.size;
++  } catch {
++    return undefined;
++  }
++  if (size > RESUME_MAX_BYTES) return undefined;
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
++  } catch {
++    return undefined;
++  }
++  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
++  const record = parsed as Partial<RunResumeRecord>;
++  if (record.format !== RESUME_FORMAT || typeof record.id !== "string"
++    || record.id !== path.basename(runDirectory)
++    || typeof record.cwd !== "string" || typeof record.task !== "string"
++    || typeof record.sessionFile !== "string" || !path.isAbsolute(record.sessionFile)
++    || typeof record.deadlineAt !== "number" || !Number.isFinite(record.deadlineAt)
++    || typeof record.writtenAt !== "number" || !Number.isFinite(record.writtenAt)) return undefined;
++  const attempts = typeof record.attempts === "number" && Number.isInteger(record.attempts) && record.attempts >= 0
++    ? record.attempts
++    : 0;
++  const launch = readLaunch(record.launch);
++  if (!launch) return undefined;
++  return {
++    format: RESUME_FORMAT,
++    id: record.id,
++    cwd: record.cwd,
++    task: record.task,
++    sessionFile: record.sessionFile,
++    launch,
++    deadlineAt: record.deadlineAt,
++    attempts,
++    writtenAt: record.writtenAt,
++  };
++};
++
++/**
++ * Why this record must not be executed here, or undefined when it may. Every
++ * launch field must match what this host would have launched itself: the worker
++ * entry, the run id, the run's own directory and cwd, and the session file must
++ * sit inside that run directory.
++ */
++export const runResumeMismatch = (
++  record: RunResumeRecord,
++  expected: {
++    runDirectory: string;
++    workerPath: string;
++    cwd: string;
++    sessionFile?: string;
++  },
++): string | undefined => {
++  if (record.launch.id !== record.id) return "the resume launch names another run";
++  if (record.launch.workerPath !== expected.workerPath) return "the resume launch points at another worker entry";
++  if (record.launch.cwd !== record.cwd) return "the resume launch runs in another directory";
++  if (expected.cwd !== record.cwd) return "the resume launch runs in another directory than the run record";
++  if (fs.realpathSync.native(expected.runDirectory) !== path.dirname(record.sessionFile)
++    && !record.sessionFile.startsWith(`${fs.realpathSync.native(expected.runDirectory)}${path.sep}`)) {
++    return "the resume session file is outside the run directory";
++  }
++  if (expected.sessionFile && record.sessionFile !== expected.sessionFile) {
++    return "the resume session file is not the one this run was launched with";
++  }
++  const argument = (name: string): string | undefined => {
++    const index = record.launch.workerArguments.indexOf(`--${name}`);
++    return index < 0 ? undefined : record.launch.workerArguments[index + 1];
++  };
++  if (argument("cwd") !== undefined && argument("cwd") !== record.cwd) {
++    return "the resume launch carries a cwd that disagrees with its run";
++  }
++  if (argument("status-file") !== undefined
++    && path.dirname(String(argument("status-file"))) !== fs.realpathSync.native(expected.runDirectory)) {
++    return "the resume launch writes another run's status file";
++  }
++  return undefined;
++};
+diff --git a/src/audit/projection.ts b/src/audit/projection.ts
+index 9d471ba..b8c0b87 100644
+--- a/src/audit/projection.ts
++++ b/src/audit/projection.ts
+@@ -134,6 +134,7 @@ const idOnlyAgentActions = new Set([
+   "agents.join",
+   "agents.status",
+   "agents.stop",
++  "agents.resume",
+   "agents.sleep",
+   "agents.wake",
+   "agents.cleanup",
+diff --git a/src/config.ts b/src/config.ts
+index 641ee90..ce1be96 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -234,6 +234,12 @@ export interface FabricAgentConfig {
+    * directory, with a worker-role entry, so a relaunch keeps extension state.
+    */
+   durableWorkerSession?: boolean;
++  /**
++   * Opt-in: every built-in Pi child keeps a private Pi session file in its run
++   * directory, so a terminal run can be continued from its own transcript
++   * through `agents.resume` instead of restarting from a text summary.
++   */
++  childSession?: boolean;
+   notifyOnComplete: boolean;
+   budgetUsd: number;
+   maxTokensPerChild: number;
+@@ -578,6 +584,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
+     retainRuns: false,
+     durableWorkerRecovery: false,
+     durableWorkerSession: false,
++    childSession: false,
+     notifyOnComplete: true,
+     budgetUsd: 0,
+     maxTokensPerChild: 0,
+@@ -1301,6 +1308,10 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
+         agents.durableWorkerSession,
+         DEFAULT_FABRIC_CONFIG.agents.durableWorkerSession ?? false,
+       ),
++      childSession: booleanValue(
++        agents.childSession,
++        DEFAULT_FABRIC_CONFIG.agents.childSession ?? false,
++      ),
+       notifyOnComplete: booleanValue(
+         agents.notifyOnComplete,
+         DEFAULT_FABRIC_CONFIG.agents.notifyOnComplete,
+diff --git a/src/durable/worker-role-seed.ts b/src/durable/worker-role-seed.ts
+index 947824b..fa3e2e9 100644
+--- a/src/durable/worker-role-seed.ts
++++ b/src/durable/worker-role-seed.ts
+@@ -213,14 +213,19 @@ const secureSessionFile = (folder: string, file: string): void => {
+  * leaves at most a stray `tmp-<uuid>.jsonl`, possibly as a
+  * second name for `session.jsonl`; a relaunch removes it and run retention
+  * reclaims the pair with the run.
++ *
++ * `folderName` names the folder inside the run directory: the pi-durable
++ * durable session uses `durable-session`, and a resumable child session
++ * (agents.childSession) uses `child-session` so the two never collide.
+  */
+ export const createDurableSessionFile = (
+   runDirectory: string,
+   cwd: string,
+   hooks: { beforeLink?: () => void } = {},
++  folderName = "durable-session",
+ ): string => {
+   securePrivateRunDirectory(runDirectory);
+-  const folder = ensureSessionFolder(runDirectory, "durable-session");
++  const folder = ensureSessionFolder(runDirectory, folderName);
+   const file = path.join(folder, "session.jsonl");
+   let exists = true;
+   try {
+diff --git a/src/providers/agents-actions.ts b/src/providers/agents-actions.ts
+index efe2ee9..d4ed8f3 100644
+--- a/src/providers/agents-actions.ts
++++ b/src/providers/agents-actions.ts
+@@ -259,6 +259,20 @@ const parkResultSchema = (requested: "sleep" | "wake") => ({
+   additionalProperties: false,
+ });
+ 
++const resumeSchema = {
++  type: "object",
++  properties: {
++    id: { type: "string" },
++    task: {
++      type: "string",
++      description: "Optional instruction added to the child's own task when it continues; omitted continues the original task unchanged",
++    },
++    timeoutMs: runProperties.timeoutMs,
++  },
++  required: ["id"],
++  additionalProperties: false,
++};
++
+ const lifecycleEventSchema = {
+   type: "string",
+   enum: [...FABRIC_LIFECYCLE_EVENTS],
+@@ -286,6 +300,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
+     inputSchema: spawnSchema,
+     risk: "agent",
+   },
++  {
++    name: "resume",
++    description:
++      "Continue a terminal child agent from the session transcript it wrote (requires the agents.childSession setting). The child reopens its own session in the same run directory and working tree, so work a stopped attempt finished is carried instead of re-derived from a summary; the run keeps its id and gets a fresh deadline. Returns a handle: wait with agents.wait. Three manual resumes bound one run.",
++    inputSchema: resumeSchema,
++    risk: "agent",
++  },
+   {
+     name: "wait",
+     description: "Wait for a previously spawned child agent and acknowledge its result, suppressing a duplicate completion notification",
+diff --git a/src/providers/agents-provider.ts b/src/providers/agents-provider.ts
+index b5ca39d..fd304be 100644
+--- a/src/providers/agents-provider.ts
++++ b/src/providers/agents-provider.ts
+@@ -1054,6 +1054,23 @@ export class AgentsProvider implements FabricProvider {
+       }
+       case "stop":
+         return this.stopParticipant(String(args.id));
++      case "resume": {
++        const id = String(args.id);
++        const handle = await this.manager.resume(
++          id,
++          typeof args.task === "string" ? args.task : undefined,
++          typeof args.timeoutMs === "number" ? args.timeoutMs : undefined,
++        );
++        this.participants.scheduleRefresh();
++        context.activity?.({
++          type: "entity",
++          id: handle.id,
++          kind: "agent",
++          name: handle.name,
++        });
++        context.update(`Resumed ${handle.name} from its own transcript (${handle.id})`);
++        return handle;
++      }
+       case "sleep":
+       case "wake": {
+         const id = String(args.id);
+diff --git a/src/runtime/guest-types.ts b/src/runtime/guest-types.ts
+index 0d882ca..fe23b61 100644
+--- a/src/runtime/guest-types.ts
++++ b/src/runtime/guest-types.ts
+@@ -774,8 +774,12 @@ interface FabricAgentDefinition {
+ }
+ interface FabricAgentsApi {
+   run(args: FabricAgentRequest): Promise<FabricAgentResult>;
+-  /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
+-  resume(args: FabricAgentTargetArgs & { task?: string }): Promise<FabricAgentResult>;
++  /**
++   * Continue a terminal child agent from the session transcript it wrote (needs the
++   * agents.childSession setting). The child reopens its own session in the same run
++   * directory; the run keeps its id and gets a fresh deadline. Returns a handle.
++   */
++  resume(args: FabricAgentTargetArgs & { task?: string; timeoutMs?: number }): Promise<FabricAgentHandle>;
+   handoff(args: FabricHandoffRequest): Promise<FabricHandoffResult>;
+   spawn(args: FabricAgentRequest): Promise<FabricAgentHandle>;
+   /** Observe local operational progress, not transcripts. Stop the returned handle with tasks.stop. */
+diff --git a/src/runtime/quickjs-runtime.ts b/src/runtime/quickjs-runtime.ts
+index 1859577..d80ed3c 100644
+--- a/src/runtime/quickjs-runtime.ts
++++ b/src/runtime/quickjs-runtime.ts
+@@ -534,6 +534,7 @@ globalThis.agents = Object.freeze({
+   unsubscribe: (args) => __call("agents.unsubscribe", args),
+   models: (args = {}) => __call("agents.models", args),
+   stop: (args) => __call("agents.stop", args),
++  resume: (args) => __call("agents.resume", args),
+   cleanup: (args) => __call("agents.cleanup", args),
+   sleep: (args) => __call("agents.sleep", args),
+   wake: (args) => __call("agents.wake", args),
+diff --git a/tests/agent-resume.test.ts b/tests/agent-resume.test.ts
+new file mode 100644
+index 0000000..7c546ed
+--- /dev/null
++++ b/tests/agent-resume.test.ts
+@@ -0,0 +1,121 @@
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
++import { AgentManager } from "../src/agents/manager.js";
++import { MAX_MANUAL_RESUMES, readRunResume } from "../src/agents/resume.js";
++
++const managers: AgentManager[] = [];
++const roots: string[] = [];
++const fakePi = path.resolve("tests/fixtures/fake-pi-rpc-session.mjs");
++fs.chmodSync(fakePi, 0o755);
++
++afterEach(async () => {
++  await Promise.all(managers.splice(0).map((manager) => manager.close()));
++  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
++});
++
++const createManager = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}) => {
++  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-resume-")));
++  roots.push(root);
++  const manager = new AgentManager(process.cwd(), {
++    ...DEFAULT_FABRIC_CONFIG.agents,
++    runner: "pi",
++    retainRuns: true,
++    ...agents,
++  }, {
++    workerPath: path.resolve("src/worker.ts"),
++    piBinary: fakePi,
++    runRoot: root,
++    fullCodeMode: false,
++  });
++  managers.push(manager);
++  return { manager, root };
++};
++
++const transcriptTurns = (sessionFile: string): number => fs.readFileSync(sessionFile, "utf8")
++  .split("\n")
++  .filter((line) => line.includes('"role"'))
++  .length;
++
++describe("resumable child agents", () => {
++  it("continues a finished child from the session transcript it wrote", { timeout: 30_000 }, async () => {
++    const { manager, root } = createManager({ childSession: true });
++    const handle = await manager.spawn({ task: "Build the lane", transport: "process", timeoutMs: 20_000 });
++    const first = await manager.wait(handle.id);
++    expect(first.status).toBe("completed");
++    expect(JSON.parse(first.text)).toMatchObject({ attempt: 1, task: "Build the lane" });
++
++    const runDirectory = manager.runDirectory(handle.id);
++    expect(runDirectory).toBeDefined();
++    const sessionFile = path.join(String(runDirectory), "child-session", "session.jsonl");
++    expect(fs.existsSync(sessionFile)).toBe(true);
++    expect(transcriptTurns(sessionFile)).toBe(2);
++    const authority = readRunResume(String(runDirectory));
++    expect(authority?.sessionFile).toBe(fs.realpathSync(sessionFile));
++    expect(authority?.attempts).toBe(0);
++
++    const resumed = await manager.resume(handle.id, "also land the regression test");
++    expect(resumed.id).toBe(handle.id);
++    expect(resumed.status).toBe("running");
++
++    const second = await manager.wait(handle.id);
++    expect(second.status).toBe("completed");
++    const continued = JSON.parse(second.text);
++    // The child reopened its own session: the transcript grew instead of restarting.
++    expect(continued.attempt).toBe(2);
++    expect(transcriptTurns(sessionFile)).toBe(4);
++    // It was handed its original task plus a continuation note carrying the instruction.
++    expect(continued.task).toContain("[Fabric continuation]");
++    expect(continued.task).toContain("also land the regression test");
++    expect(continued.task).toContain("Build the lane");
++    expect(readRunResume(String(runDirectory))?.attempts).toBe(1);
++    // The run kept its identity: same run directory, inside this test's run root.
++    expect(fs.realpathSync(String(runDirectory))).toContain(root);
++  });
++
++  it("revives a child that died with work in flight", { timeout: 30_000 }, async () => {
++    const { manager } = createManager({ childSession: true });
++    const handle = await manager.spawn({
++      task: "DIE_WITHOUT_RESULT after writing the first draft",
++      transport: "process",
++      timeoutMs: 20_000,
++    });
++    const interrupted = await manager.wait(handle.id);
++    expect(interrupted.status).toBe("failed");
++
++    const runDirectory = String(manager.runDirectory(handle.id));
++    const sessionFile = path.join(runDirectory, "child-session", "session.jsonl");
++    expect(transcriptTurns(sessionFile)).toBe(2);
++
++    const resumed = await manager.resume(handle.id);
++    expect(resumed.status).toBe("running");
++    const result = await manager.wait(handle.id);
++    expect(result.status).toBe("completed");
++    expect(JSON.parse(result.text).attempt).toBe(2);
++  });
++
++  // The default `pi-durable` runner keeps a recorded-result journal of its own, so
++  // `agents.resume` re-runs the continuation on the plain `pi` runner (same session
++  // file). That path needs a real Pi session runtime and is covered by
++  // scripts/manual-resume-e2e.ts against a live model, not by the fake-RPC fixture.
++
++  it("refuses to resume a run that was launched without a child session", { timeout: 30_000 }, async () => {
++    const { manager } = createManager();
++    const handle = await manager.spawn({ task: "One shot", transport: "process", timeoutMs: 20_000 });
++    expect((await manager.wait(handle.id)).status).toBe("completed");
++    await expect(manager.resume(handle.id)).rejects.toThrow(/no resume record/);
++  });
++
++  it("bounds how often one run may be resumed", { timeout: 60_000 }, async () => {
++    const { manager } = createManager({ childSession: true });
++    const handle = await manager.spawn({ task: "Keep going", transport: "process", timeoutMs: 20_000 });
++    await manager.wait(handle.id);
++    for (let index = 0; index < MAX_MANUAL_RESUMES; index += 1) {
++      expect((await manager.resume(handle.id)).status).toBe("running");
++      expect((await manager.wait(handle.id)).status).toBe("completed");
++    }
++    await expect(manager.resume(handle.id)).rejects.toThrow(/manual resumes/);
++  });
++});
+diff --git a/tests/fixtures/fake-pi-rpc-session.mjs b/tests/fixtures/fake-pi-rpc-session.mjs
+new file mode 100755
+index 0000000..f6968a0
+--- /dev/null
++++ b/tests/fixtures/fake-pi-rpc-session.mjs
+@@ -0,0 +1,107 @@
++#!/usr/bin/env node
++// Fake Pi for the resumable-child tests: it appends transcript entries to the
++// session file it was launched with (what a real Pi session does) and echoes the
++// task back, so a test can see exactly what a continued child was handed.
++
++import fs from "node:fs";
++import readline from "node:readline";
++
++const argv = process.argv.slice(2);
++const flag = (name) => {
++  const index = argv.indexOf(name);
++  return index < 0 || index + 1 >= argv.length ? undefined : argv[index + 1];
++};
++const sessionFile = flag("--session");
++
++const send = (event) => {
++  process.stdout.write(`${JSON.stringify(event)}\n`);
++};
++
++const usage = { input: 3, output: 4, cacheRead: 0, cacheWrite: 0 };
++
++const successMessage = (text) => ({
++  role: "assistant",
++  content: [{ type: "text", text }],
++  provider: "fake",
++  model: "fake-model",
++  usage,
++  stopReason: "stop",
++});
++
++const finishAttempt = (message) => {
++  send({ type: "message_end", message });
++  send({ type: "turn_end", message, toolResults: [] });
++  send({ type: "agent_end", messages: [message], willRetry: false });
++  send({ type: "agent_settled" });
++};
++
++/** Append one user turn and one assistant turn: the transcript a resume continues from. */
++const appendTranscript = (task) => {
++  if (!sessionFile) return 0;
++  let turns = 0;
++  try {
++    turns = fs.readFileSync(sessionFile, "utf8").split("\n").filter((line) => line.includes('"role"')).length;
++  } catch {
++    turns = 0;
++  }
++  const timestamp = () => new Date().toISOString();
++  const entries = [
++    { type: "message", id: `user-${turns}`, parentId: null, timestamp: timestamp(), message: { role: "user", content: task } },
++    {
++      type: "message",
++      id: `assistant-${turns}`,
++      parentId: `user-${turns}`,
++      timestamp: timestamp(),
++      message: {
++        role: "assistant",
++        content: [{ type: "text", text: `attempt ${turns / 2 + 1} turn` }],
++        provider: "fake",
++        model: "fake-model",
++        usage,
++        stopReason: "stop",
++      },
++    },
++  ];
++  fs.appendFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
++  return turns / 2 + 1;
++};
++
++let started = false;
++const recorded = [];
++const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
++input.on("line", (line) => {
++  if (!line.trim()) return;
++  let command;
++  try {
++    command = JSON.parse(line);
++  } catch {
++    return;
++  }
++  // The durable runner reads its answer back out of the session it recorded.
++  if (command.type === "get_messages") {
++    send({ type: "response", id: command.id, command: "get_messages", success: true, data: { messages: recorded } });
++    return;
++  }
++  if (started) return;
++  started = true;
++  const task = typeof command.message === "string" ? command.message : "";
++
++  send({ type: "response", command: "prompt", success: true });
++  send({ type: "agent_start" });
++
++  if (task.includes("DIE_WITHOUT_RESULT") && !task.includes("[Fabric continuation]")) {
++    // Mid-run interruption: work lands in the session, then the child dies.
++    appendTranscript(task);
++    process.exit(1);
++  }
++
++  const attempt = appendTranscript(task);
++  const message = successMessage(JSON.stringify({ attempt, task }));
++  recorded.push({ role: "user", content: task }, message);
++  finishAttempt(message);
++});
++
++process.stdin.on("end", () => {
++  setTimeout(() => process.exit(0), 5);
++});
++process.stdin.resume();

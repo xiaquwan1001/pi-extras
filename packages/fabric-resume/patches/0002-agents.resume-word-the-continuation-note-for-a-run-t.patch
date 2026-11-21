@@ -1,0 +1,32 @@
+From f84377269b084ee76f736329a4fca4db1ef6bc38 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 17 Nov 2026 11:00:45 +0800
+Subject: [PATCH 2/5] agents.resume: word the continuation note for a run that
+ completed
+
+---
+ src/agents/manager.ts | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/agents/manager.ts b/src/agents/manager.ts
+index eceea50..5e5280c 100644
+--- a/src/agents/manager.ts
++++ b/src/agents/manager.ts
+@@ -431,10 +431,15 @@ const continuationTask = (
+   instruction?: string,
+ ): string => {
+   const summary = summarizeRunLog(runDirectory, 6);
++  const finished = record.status === "completed";
+   const note = [
+-    "[Fabric continuation] Your previous attempt at this exact task stopped before it finished.",
++    finished
++      ? "[Fabric continuation] Your coordinator is continuing the task you already worked on in this session."
++      : "[Fabric continuation] Your previous attempt at this exact task stopped before it finished.",
+     `It ended with status "${record.status}"${record.error ? ` (${record.error})` : ""} after ${record.turns} turns and ${record.toolCalls} tool calls; your earlier turns are in this session, and the working tree already contains what that attempt completed.`,
+-    "Inspect the current state first, do not redo work that is already done, and carry the task through to completion.",
++    finished
++      ? "Read your earlier turns, then carry the task further from where you left off instead of starting over."
++      : "Inspect the current state first, do not redo work that is already done, and carry the task through to completion.",
+     ...(summary ? [`Last observed run activity: ${summary}`] : []),
+     ...(instruction?.trim() ? [`Your coordinator adds: ${instruction.trim().slice(0, MAX_RESUME_NOTE_CHARS)}`] : []),
+   ].join(" ");

@@ -1,0 +1,42 @@
+{
+  "name": "pi-fabric-resume",
+  "version": "0.1.0",
+  "description": "Resumable Fabric children without forking pi-fabric: re-installs a tested runtime overlay that gives every child its own session, so agents.resume({ id }) continues an interrupted, crashed or post-reboot run from its own transcript.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Qianhui Xu",
+  "homepage": "https://github.com/xiaquwan1001/pi-extras/tree/main/packages/fabric-resume",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaquwan1001/pi-extras.git",
+    "directory": "packages/fabric-resume"
+  },
+  "bugs": {
+    "url": "https://github.com/xiaquwan1001/pi-extras/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-fabric",
+    "agents",
+    "resume",
+    "checkpoint",
+    "reliability",
+    "overlay"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "overlay",
+    "patches",
+    "scripts",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

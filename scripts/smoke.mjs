@@ -270,6 +270,99 @@ rmSync(root, { recursive: true, force: true });
 	}
 }
 
+// ---------------------------------------------------------------- fabric-resume
+{
+	const { createHash } = await import("node:crypto");
+	const { existsSync, readFileSync: readFile, writeFileSync: writeFile } = await import("node:fs");
+	const { gzipSync } = await import("node:zlib");
+	const { applyResumeOverlay, extractDistTarGz } = await import("../packages/fabric-resume/extensions/overlay.ts");
+	const resumePackage = join(root, "fabric-resume-source");
+	const overlayDir = join(resumePackage, "overlay");
+	mkdirSync(overlayDir, { recursive: true });
+	// Reuse the real overlay shipped with the package: the test proves the artifact,
+	// not a fixture that could drift from it.
+	const realPackage = new URL("../packages/fabric-resume/", import.meta.url);
+	const manifest = JSON.parse(readFile(new URL("overlay/manifest.json", realPackage), "utf8"));
+	for (const file of ["overlay/manifest.json", manifest.tar]) {
+		writeFile(join(resumePackage, file), readFile(new URL(file, realPackage)));
+	}
+
+	const npmDir = join(root, "npm");
+	const target = join(npmDir, "pi-fabric");
+	mkdirSync(target, { recursive: true });
+	writeFile(join(target, "package.json"), JSON.stringify({ name: "pi-fabric", version: manifest.upstream }));
+	writeFile(join(target, "dist-sentinel.txt"), "before");
+	mkdirSync(join(target, "dist"), { recursive: true });
+	writeFile(join(target, "dist", "chunk-old.js"), "stale build\n");
+
+	check("fabric-resume: applies the shipped overlay to the matching upstream release", () => {
+		const result = applyResumeOverlay({ packageRoot: resumePackage, npmDir, now: 1 });
+		assert.equal(result.status, "applied");
+		assert.equal(result.written, manifest.files.length);
+		const marker = JSON.parse(readFile(join(target, manifest.marker), "utf8"));
+		assert.equal(marker.build, manifest.build);
+		const worker = readFile(join(target, "dist", "worker.js"));
+		const digest = createHash("sha256").update(worker).digest("hex");
+		assert.equal(digest, manifest.files.find((file) => file.path === "dist/worker.js").sha256);
+	});
+
+	check("fabric-resume: second run is a no-op", () => {
+		const result = applyResumeOverlay({ packageRoot: resumePackage, npmDir, now: 2 });
+		assert.equal(result.status, "already");
+	});
+
+	check("fabric-resume: refuses another pi-fabric release instead of mixing builds", () => {
+		const otherNpm = join(root, "npm-other");
+		mkdirSync(join(otherNpm, "pi-fabric", "dist"), { recursive: true });
+		writeFile(join(otherNpm, "pi-fabric", "package.json"), JSON.stringify({ name: "pi-fabric", version: "0.140.0" }));
+		const result = applyResumeOverlay({ packageRoot: resumePackage, npmDir: otherNpm, now: 3 });
+		assert.equal(result.status, "version-mismatch");
+		assert.equal(existsSync(join(otherNpm, "pi-fabric", manifest.marker)), false);
+	});
+
+	check("fabric-resume: refuses an archive that does not match the manifest", () => {
+		const corruptPackage = join(root, "fabric-resume-corrupt");
+		mkdirSync(join(corruptPackage, "overlay"), { recursive: true });
+		const corruptManifest = structuredClone(manifest);
+		corruptManifest.files[0] = { ...corruptManifest.files[0], sha256: "0".repeat(64) };
+		writeFile(join(corruptPackage, "overlay", "manifest.json"), JSON.stringify(corruptManifest));
+		writeFile(join(corruptPackage, manifest.tar), readFile(new URL(manifest.tar, realPackage)));
+		const corruptNpm = join(root, "npm-corrupt");
+		mkdirSync(join(corruptNpm, "pi-fabric", "dist"), { recursive: true });
+		writeFile(join(corruptNpm, "pi-fabric", "package.json"), JSON.stringify({ name: "pi-fabric", version: manifest.upstream }));
+		const result = applyResumeOverlay({ packageRoot: corruptPackage, npmDir: corruptNpm, now: 4 });
+		assert.equal(result.status, "integrity");
+		assert.equal(existsSync(join(corruptNpm, "pi-fabric", manifest.marker)), false);
+		assert.equal(existsSync(join(corruptNpm, "pi-fabric", manifest.files[0].path)), false);
+	});
+
+	check("fabric-resume: reader handles only regular files and rejects traversal", () => {
+		const body = Buffer.from("hello");
+		const header = Buffer.alloc(512, 0);
+		header.write("../escape.js", 0, "utf8");
+		header.write("0000644", 100, "utf8");
+		header.write(body.length.toString(8).padStart(11, "0"), 124, "utf8");
+		header.write("0", 156, "utf8");
+		header.write("ustar", 257, "utf8");
+		const archive = gzipSync(Buffer.concat([header, body, Buffer.alloc(512, 0)]));
+		const entries = extractDistTarGz(archive);
+		assert.deepEqual([...entries.keys()], ["../escape.js"]);
+		const escapeNpm = join(root, "npm-escape");
+		mkdirSync(join(escapeNpm, "pi-fabric", "dist"), { recursive: true });
+		writeFile(join(escapeNpm, "pi-fabric", "package.json"), JSON.stringify({ name: "pi-fabric", version: manifest.upstream }));
+		const escapePackage = join(root, "fabric-resume-escape");
+		mkdirSync(join(escapePackage, "overlay"), { recursive: true });
+		writeFile(
+			join(escapePackage, "overlay", "manifest.json"),
+			JSON.stringify({ ...manifest, files: [{ path: "dist/escape.js", bytes: body.length, sha256: createHash("sha256").update(body).digest("hex") }] }),
+		);
+		writeFile(join(escapePackage, manifest.tar), archive);
+		const result = applyResumeOverlay({ packageRoot: escapePackage, npmDir: escapeNpm, now: 5 });
+		assert.equal(result.status, "integrity");
+		assert.equal(existsSync(join(root, "escape.js")), false);
+	});
+}
+
 if (process.exitCode) {
 	console.error(`\n${passed.length} check(s) passed, some failed`);
 } else {

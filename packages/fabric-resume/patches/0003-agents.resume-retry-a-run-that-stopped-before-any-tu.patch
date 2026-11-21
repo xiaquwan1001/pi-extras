@@ -1,0 +1,91 @@
+From 3291d398990f90a6a3743a01082aafd92c2d90df Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 17 Nov 2026 11:02:50 +0800
+Subject: [PATCH 3/5] agents.resume: retry a run that stopped before any turn
+ instead of refusing
+
+---
+ docs/agents.md                         |  2 +-
+ src/agents/manager.ts                  |  9 +++++++--
+ tests/agent-resume.test.ts             | 18 ++++++++++++++++++
+ tests/fixtures/fake-pi-rpc-session.mjs |  5 +++++
+ 4 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/docs/agents.md b/docs/agents.md
+index 27c7a94..1db7475 100644
+--- a/docs/agents.md
++++ b/docs/agents.md
+@@ -595,7 +595,7 @@ if (stopped.status !== "completed") {
+ 
+ `agents.resume` reopens the child's session file with the same run id, run directory, cwd, tools, and model, so the child sees the turns it already made and does not redo finished work. It receives a short continuation note naming how the previous attempt ended, plus its original task and your optional extra `task` as fresh instruction. The run keeps its identity: usage and turn counts carry over, a fresh `timeoutMs` starts counting, and `run.resumed` reports the attempt. A resumed run is a live run again — `agents.wait`, `status`, `steer`, and `followUp` behave as for any other run, and a detached resumed run notifies its completion like any detached one.
+ 
+-The limits are deliberate. Only a run that has settled is resumed (a live run takes `steer`/`followUp` instead), only Fabric's own Pi runners qualify, and only the launch the host recorded for that run is ever re-executed: the record beside the run (`resume.json`) is written by the host and re-validated against this host's worker entry, run directory, and cwd, so nothing outside the run directory can point a resume at another program. Three manual resumes bound one run, and the manual count shares the automatic budget. `agents.cleanup` and run retention remove the record with the run, and the run root is deleted when a session closes unless `agents.retainRuns` is on, so resume continues a run this session still owns; a run from an earlier session is continued with [`residency: "durable"`](durable-pi.md) plus `agents.durableWorkerRecovery` instead. A child launched before the setting was enabled has no session to reopen, and `agents.resume` names that reason.
++The limits are deliberate. Only a run that has settled is resumed (a live run takes `steer`/`followUp` instead), only Fabric's own Pi runners qualify. A run stopped before it produced a single turn has no transcript to carry and is simply tried again under the same run id; a run that made turns whose session file holds none is refused rather than silently restarted., and only the launch the host recorded for that run is ever re-executed: the record beside the run (`resume.json`) is written by the host and re-validated against this host's worker entry, run directory, and cwd, so nothing outside the run directory can point a resume at another program. Three manual resumes bound one run, and the manual count shares the automatic budget. `agents.cleanup` and run retention remove the record with the run, and the run root is deleted when a session closes unless `agents.retainRuns` is on, so resume continues a run this session still owns; a run from an earlier session is continued with [`residency: "durable"`](durable-pi.md) plus `agents.durableWorkerRecovery` instead. A child launched before the setting was enabled has no session to reopen, and `agents.resume` names that reason.
+ 
+ Set `worktree: true` to create a dedicated Git worktree and a `pi-fabric/<name>-<id8>` branch from the repository containing the selected `cwd`. Fabric writes that worktree at `<repo>/.pi/fabric/worktrees/<id>` so copy-on-write cloning can keep ignored build artifacts on the same volume, and it records the path in the repository `.git/info/exclude` file. Configure `agents.worktree.root` (relative to the selected Git root) and `agents.worktree.branch` (tokens `{name}`, `{id}`, `{id8}`) to override these defaults; for example, `{ "root": ".worktrees", "branch": "issue/{name}-{id}" }`. Cleanup uses the creation-time path and branch, including for durable agents after config changes. Simple `git worktree add` commands run through `pi.bash` take the same clone-first path. Fabric retains worktrees for inspection until you call `agents.cleanup()`. When the selected cwd is a repository subdirectory, Fabric uses the matching subdirectory in the generated worktree when it exists; otherwise it uses the worktree root. The reported effective cwd is the generated worktree path, and Pi evaluates that generated path as its own canonical cwd. The caller's project and mesh roots remain unchanged, so a child targeting another repository still belongs to the orchestrating Fabric topology. A recursive child in a worktree stays in the same participant directory and does not create another `.pi/fabric/mesh` inside that worktree.
+ 
+diff --git a/src/agents/manager.ts b/src/agents/manager.ts
+index 5e5280c..1d3af51 100644
+--- a/src/agents/manager.ts
++++ b/src/agents/manager.ts
+@@ -2127,8 +2127,13 @@ export class AgentManager {
+       ...(managed.childSessionFile ? { sessionFile: managed.childSessionFile } : {}),
+     });
+     if (mismatch) throw new Error(`Fabric agent ${id} cannot be resumed: ${mismatch}`);
+-    if (!this.#sessionHasTranscript(authority.sessionFile)) {
+-      throw new Error(`Fabric agent ${id} cannot be resumed: its session file holds no turns to continue`);
++    const madeProgress = record.turns > 0 || record.toolCalls > 0
++      || managed.observedProgress.turns > 0 || managed.observedProgress.toolCalls > 0;
++    if (!this.#sessionHasTranscript(authority.sessionFile) && madeProgress) {
++      throw new Error(
++        `Fabric agent ${id} cannot be resumed: it made ${record.turns} turns and ${record.toolCalls} tool calls ` +
++        "but its session file holds no turns, so there is no transcript to continue from",
++      );
+     }
+     if (!fs.existsSync(managed.cwd)) {
+       throw new Error(`Fabric agent ${id} cannot be resumed: its working directory ${managed.cwd} no longer exists`);
+diff --git a/tests/agent-resume.test.ts b/tests/agent-resume.test.ts
+index 7c546ed..93265b0 100644
+--- a/tests/agent-resume.test.ts
++++ b/tests/agent-resume.test.ts
+@@ -108,6 +108,24 @@ describe("resumable child agents", () => {
+     await expect(manager.resume(handle.id)).rejects.toThrow(/no resume record/);
+   });
+ 
++  it("resumes a run that never produced a turn as a fresh attempt", { timeout: 30_000 }, async () => {
++    // Stopped or killed before any turn: nothing to carry, so the same run may
++    // simply be tried again rather than refused for lacking a transcript.
++    const { manager } = createManager({ childSession: true });
++    const handle = await manager.spawn({
++      task: "DIE_BEFORE_SESSION immediately",
++      transport: "process",
++      timeoutMs: 20_000,
++    });
++    const died = await manager.wait(handle.id);
++    expect(died.status).toBe("failed");
++    const resumed = await manager.resume(handle.id);
++    expect(resumed.status).toBe("running");
++    const result = await manager.wait(handle.id);
++    expect(result.status).toBe("completed");
++    expect(JSON.parse(result.text).task).toContain("[Fabric continuation]");
++  });
++
+   it("bounds how often one run may be resumed", { timeout: 60_000 }, async () => {
+     const { manager } = createManager({ childSession: true });
+     const handle = await manager.spawn({ task: "Keep going", transport: "process", timeoutMs: 20_000 });
+diff --git a/tests/fixtures/fake-pi-rpc-session.mjs b/tests/fixtures/fake-pi-rpc-session.mjs
+index f6968a0..2ee11ea 100755
+--- a/tests/fixtures/fake-pi-rpc-session.mjs
++++ b/tests/fixtures/fake-pi-rpc-session.mjs
+@@ -89,6 +89,11 @@ input.on("line", (line) => {
+   send({ type: "response", command: "prompt", success: true });
+   send({ type: "agent_start" });
+ 
++  if (task.includes("DIE_BEFORE_SESSION") && !task.includes("[Fabric continuation]")) {
++    // Killed before the child opened a turn: the run has no transcript at all.
++    process.exit(1);
++  }
++
+   if (task.includes("DIE_WITHOUT_RESULT") && !task.includes("[Fabric continuation]")) {
+     // Mid-run interruption: work lands in the session, then the child dies.
+     appendTranscript(task);
