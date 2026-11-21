@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric-resume",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Resumable Fabric children without forking pi-fabric: re-installs a tested runtime overlay that gives every child its own session, so agents.resume({ id }) continues an interrupted, crashed or post-reboot run from its own transcript.",
   "type": "module",
   "license": "MIT",
