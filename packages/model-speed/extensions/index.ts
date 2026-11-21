@@ -39,9 +39,12 @@
  *   "auto": true,
  *   "providers": [],          // providers where switching is allowed; [] = any provider with 2+ models
  *   "candidates": [],         // model ids or "provider/id" to consider; [] = every model of the provider
- *   "thresholds": { "ttftSmallMs": 12000, "ttftLargeMs": 25000, "largePromptTokens": 30000, "tpotMs": 250 },
+ *   "thresholds": { "ttftSmallMs": 12000, "ttftLargeMs": 25000, "largePromptTokens": 30000, "tpotMs": 250, "turnWallMs": 90000 },
  *   "window": 3,
- *   "cooldownMs": 600000,
+ *   "minSlowInWindow": 2,        // how many of the last `window` samples must be slow
+ *   "switchCooldownMs": 180000,  // min gap between switches *in one session*
+ *   "maxSwitchesPerSession": 3,  // a session may step off more than once
+ *   "cooldownMs": 600000,        // ping-pong window: don't go back to a model just left
  *   "sessionBinding": {
  *     "warmTurns": 3,              // turns after which the session counts as bound
  *     "warmAfterMs": 600000,       // ... or this much wall time into the session
@@ -58,7 +61,7 @@
  * state directory; PI_MODEL_SPEED_CONFIG changes the config path.
  */
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -85,9 +88,12 @@ const AUTO_IN_CHILD = process.env.PI_MODEL_SPEED_ALLOW_CHILD === "1";
 const CONFIG_PATH = process.env.PI_MODEL_SPEED_CONFIG?.trim() || join(homedir(), ".pi", "agent", "model-speed.json");
 const STATE_DIR = process.env.PI_MODEL_SPEED_DIR?.trim() || join(homedir(), ".cache", "pi-model-speed");
 const LOG = join(STATE_DIR, "speed-log.jsonl");
+/** Keep the sample log small: it is appended to forever and only the tail is read. */
+const LOG_MAX_BYTES = 4 * 1024 * 1024;
+const LOG_TAIL_BYTES = 512 * 1024;
 const SWITCH_STATE = join(STATE_DIR, "switch-state.json");
 
-type Thresholds = { ttftSmallMs: number; ttftLargeMs: number; largePromptTokens: number; tpotMs: number };
+type Thresholds = { ttftSmallMs: number; ttftLargeMs: number; largePromptTokens: number; tpotMs: number; turnWallMs: number };
 type SessionBinding = {
 	warmTurns: number;
 	warmAfterMs: number;
@@ -103,6 +109,9 @@ type Config = {
 	candidates: string[];
 	thresholds: Thresholds;
 	window: number;
+	minSlowInWindow: number;
+	switchCooldownMs: number;
+	maxSwitchesPerSession: number;
 	cooldownMs: number;
 	sessionBinding: SessionBinding;
 	contextGuard: ContextGuard;
@@ -118,8 +127,11 @@ const DEFAULT_CONFIG: Config = {
 	auto: process.env.PI_MODEL_SPEED !== "0" && !(FABRIC_CHILD && !AUTO_IN_CHILD),
 	providers: [],
 	candidates: [],
-	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250 },
+	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250, turnWallMs: 90_000 },
 	window: 3,
+	minSlowInWindow: 2,
+	switchCooldownMs: 180_000,
+	maxSwitchesPerSession: 3,
 	cooldownMs: 600_000,
 	sessionBinding: {
 		warmTurns: 3,
@@ -143,19 +155,28 @@ type Sample = {
 	startedAt: number;
 	endedAt?: number;
 	error?: string;
+	/** The call took absurdly long (hung / upstream meltdown); kept, but never treated as a normal turn. */
+	longCall?: boolean;
 };
 
-type ProbeFile = {
-	ts?: number;
-	models: Record<string, { ok?: boolean; status?: string; ttft?: number | null; total?: number | null; err?: string }>;
+type ProbeEntry = {
+	ok?: boolean;
+	status?: string;
+	ttft?: number | null;
+	ttftLarge?: number | null;
+	total?: number | null;
+	err?: string;
 };
+
+type ProbeFile = { ts?: number; models: Record<string, ProbeEntry> };
 
 let config: Config = DEFAULT_CONFIG;
 let samples: Sample[] = [];
 let pending: Array<Sample> = [];
 let lastSwitchAt = 0;
-let switchedThisSession = false;
+let switchCount = 0;
 let switchTarget: string | undefined;
+let lastNoTargetAt = 0;
 let sessionStartedAt = 0;
 let turnCount = 0;
 
@@ -169,6 +190,7 @@ async function loadConfig(): Promise<Config> {
 	const thresholds = { ...DEFAULT_CONFIG.thresholds, ...(raw.thresholds ?? {}) };
 	const envThreshold = (name: string, fallback: number) => num(process.env[name], fallback);
 	const disabled = process.env.PI_MODEL_SPEED === "0" || (FABRIC_CHILD && !AUTO_IN_CHILD);
+	const window = Math.max(2, Math.floor(num(process.env.PI_MODEL_SPEED_WINDOW, num(raw.window, 3))));
 	return {
 		auto: disabled ? false : (raw.auto ?? DEFAULT_CONFIG.auto) !== false,
 		providers: Array.isArray(raw.providers) ? raw.providers.filter((v: unknown) => typeof v === "string") : [],
@@ -178,8 +200,12 @@ async function loadConfig(): Promise<Config> {
 			ttftLargeMs: envThreshold("PI_MODEL_SPEED_SLOW_LARGE_MS", num(thresholds.ttftLargeMs, 25_000)),
 			largePromptTokens: num(thresholds.largePromptTokens, 30_000),
 			tpotMs: envThreshold("PI_MODEL_SPEED_SLOW_TPOT_MS", num(thresholds.tpotMs, 250)),
+			turnWallMs: envThreshold("PI_MODEL_SPEED_SLOW_WALL_MS", num(thresholds.turnWallMs, 90_000)),
 		},
-		window: Math.max(2, Math.floor(num(process.env.PI_MODEL_SPEED_WINDOW, num(raw.window, 3)))),
+		window,
+		minSlowInWindow: Math.min(window, Math.max(1, Math.floor(num(raw.minSlowInWindow, DEFAULT_CONFIG.minSlowInWindow)))),
+		switchCooldownMs: num(raw.switchCooldownMs, DEFAULT_CONFIG.switchCooldownMs),
+		maxSwitchesPerSession: Math.max(1, Math.floor(num(raw.maxSwitchesPerSession, DEFAULT_CONFIG.maxSwitchesPerSession))),
 		cooldownMs: num(raw.cooldownMs, DEFAULT_CONFIG.cooldownMs),
 		sessionBinding: {
 			warmTurns: Math.max(1, Math.floor(num(raw.sessionBinding?.warmTurns, DEFAULT_CONFIG.sessionBinding.warmTurns))),
@@ -210,7 +236,9 @@ async function readProbe(): Promise<ProbeFile | null> {
 	}
 }
 
-async function readSwitchState(): Promise<{ lastSwitchAt?: number }> {
+type SwitchHistoryEntry = { from: string; to: string; at: number };
+
+async function readSwitchState(): Promise<{ lastSwitchAt?: number; history?: SwitchHistoryEntry[] }> {
 	try {
 		return JSON.parse(await readFile(SWITCH_STATE, "utf8"));
 	} catch {
@@ -232,8 +260,31 @@ async function appendLog(entry: Record<string, unknown>) {
 	try {
 		await mkdir(STATE_DIR, { recursive: true });
 		await appendFile(LOG, `${JSON.stringify({ ts: Date.now(), ...entry })}\n`);
+		// A log that only grows would make every history read slower forever. One
+		// rotation is enough: ranking only looks at the newest few hundred samples.
+		const size = (await stat(LOG)).size;
+		if (size > LOG_MAX_BYTES) await rename(LOG, `${LOG}.1`).catch(() => undefined);
 	} catch {
 		/* logging must never break a turn */
+	}
+}
+
+/** Last `LOG_TAIL_BYTES` of a text file, without reading the whole thing. */
+async function readTail(file: string): Promise<string> {
+	let size: number;
+	try {
+		size = (await stat(file)).size;
+	} catch {
+		return "";
+	}
+	if (size <= LOG_TAIL_BYTES) return readFile(file, "utf8");
+	const handle = await open(file, "r");
+	try {
+		const buffer = Buffer.alloc(LOG_TAIL_BYTES);
+		const { bytesRead } = await handle.read(buffer, 0, LOG_TAIL_BYTES, size - LOG_TAIL_BYTES);
+		return buffer.subarray(0, bytesRead).toString("utf8").replace(/^[^\n]*\n/, "");
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -241,7 +292,7 @@ async function appendLog(entry: Record<string, unknown>) {
 async function historyTtft(): Promise<Map<string, number>> {
 	const out = new Map<string, number>();
 	try {
-		const lines = (await readFile(LOG, "utf8")).split("\n").filter(Boolean).slice(-500);
+		const lines = (await readTail(LOG)).split("\n").filter(Boolean).slice(-500);
 		const byModel = new Map<string, number[]>();
 		for (const line of lines) {
 			let entry: any;
@@ -267,6 +318,12 @@ const median = (values: number[]): number => {
 	const sorted = [...values].sort((a, b) => a - b);
 	const mid = Math.floor(sorted.length / 2);
 	return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+/** Median over the values that exist; undefined when the samples carried no TTFT at all. */
+const definedMedian = (values: Array<number | undefined>): number | undefined => {
+	const list = values.filter((v): v is number => typeof v === "number");
+	return list.length ? median(list) : undefined;
 };
 
 const fmtMs = (ms?: number | null) =>
@@ -305,6 +362,18 @@ function contextNeed(ctx: ExtensionContext): number {
 	return tokens > 0 ? tokens + config.contextGuard.headroomTokens : 0;
 }
 
+/**
+ * Which probe number describes "how fast do I get an answer" for this session? A
+ * 200k-token session feels the large-context number, a fresh one the small one. Falling
+ * back to whichever exists beats discarding a model because one size timed out.
+ */
+function pickProbeTtft(entry: ProbeEntry, needTokens: number): number | undefined {
+	const small = typeof entry.ttft === "number" ? entry.ttft : undefined;
+	const large = typeof entry.ttftLarge === "number" ? entry.ttftLarge : undefined;
+	if (needTokens > config.thresholds.largePromptTokens && large !== undefined) return large;
+	return small ?? large;
+}
+
 /** Same-provider candidates, fastest first; unknown timings last. */
 async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 	const provider = ctx.model?.provider;
@@ -325,9 +394,9 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 			excluded.push({ id: model.id, contextWindow });
 			continue;
 		}
-		const probeTtft = probe?.models[model.id]?.ttft;
-		if (probe && probe.models[model.id]?.ok === false) candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow });
-		else if (typeof probeTtft === "number") candidates.push({ id: model.id, ttftMs: probeTtft * 1000, source: "probe", contextWindow });
+		const entry = probe?.models[model.id];
+		if (probe && entry?.ok === false) candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow });
+		else if (entry && pickProbeTtft(entry, needTokens) !== undefined) candidates.push({ id: model.id, ttftMs: pickProbeTtft(entry, needTokens)! * 1000, source: "probe", contextWindow });
 		else {
 			const hist = history.get(`${provider}/${model.id}`);
 			if (typeof hist === "number") candidates.push({ id: model.id, ttftMs: hist, source: "history", contextWindow });
@@ -360,15 +429,16 @@ function sessionBound(): boolean {
 	return false;
 }
 
-/** The last `window` usable samples, if every one of them was slow and recent. */
+/** The last `window` usable samples, if enough of them were slow and recent. */
 function slowStreak(): { tail: Sample[]; bound: boolean } | null {
-	const usable = samples.filter((s) => !s.error && s.ttftMs !== undefined);
+	const usable = samples.filter((s) => !s.error && (s.ttftMs !== undefined || s.endedAt !== undefined));
 	if (usable.length < config.window) return null;
 	const tail = usable.slice(-config.window);
 	const now = Date.now();
 	if (tail.some((s) => now - s.startedAt > config.cooldownMs)) return null;
 	const bound = sessionBound();
 	const multiplier = bound ? config.sessionBinding.boundThresholdMultiplier : 1;
+	let slowCount = 0;
 	for (const sample of tail) {
 		const prompt = sample.promptTokens ?? 0;
 		const promptLimit = prompt >= config.thresholds.largePromptTokens ? config.thresholds.ttftLargeMs : config.thresholds.ttftSmallMs;
@@ -380,8 +450,14 @@ function slowStreak(): { tail: Sample[]; bound: boolean } | null {
 		const tpotLimit = config.thresholds.tpotMs * multiplier;
 		const slowTtft = (sample.ttftMs ?? 0) > ttftLimit;
 		const slowTpot = (sample.tpotMs ?? 0) > tpotLimit;
-		if (!slowTtft && !slowTpot) return null;
+		// Wall clock is what the user actually waits for: a streaming reply at 40 tok/s that
+		// takes four minutes is slow even though its TTFT looked fine. Not multiplied — this
+		// is the "I am still waiting" signal, not a per-token nicety.
+		const wall = sample.endedAt !== undefined ? sample.endedAt - sample.startedAt : 0;
+		const slowWall = wall > config.thresholds.turnWallMs;
+		if (slowTtft || slowTpot || slowWall) slowCount += 1;
 	}
+	if (slowCount < config.minSlowInWindow) return null;
 	return { tail, bound };
 }
 
@@ -450,7 +526,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		sample.endedAt = Date.now();
 		const elapsed = sample.endedAt - sample.startedAt;
 		if (sample.ttftMs !== undefined && (sample.ttftMs < 50 || sample.ttftMs > elapsed)) delete sample.ttftMs;
-		if (elapsed > 15 * 60_000) return; // not a normal call
+		// A hung call is still a slow call. Mark it instead of dropping it, so the streak
+		// logic sees the very turns that made the user complain.
+		if (elapsed > 15 * 60_000) sample.longCall = true;
 		const usage = message?.usage;
 		if (usage) {
 			// Some gateways report only cache misses in `input`; totalTokens - output is the real prompt.
@@ -475,56 +553,86 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		turnCount += 1;
 		const current = ctx.model;
 		if (!current) return;
+		// Status line = this model's own recent TTFT, no id: the footer already names the
+		// model, so repeating it was duplication. `⚠` means slower than the applicable
+		// slow threshold for the prompt size seen most recently.
+		const mine = samples.filter((s) => s.model === current.id && typeof s.ttftMs === "number").slice(-5);
+		const mineMedian = definedMedian(mine.map((s) => s.ttftMs));
+		if (mineMedian !== undefined) {
+			const lastPrompt = mine[mine.length - 1]?.promptTokens ?? 0;
+			const limit = lastPrompt >= config.thresholds.largePromptTokens ? config.thresholds.ttftLargeMs : config.thresholds.ttftSmallMs;
+			ctx.ui.setStatus("model-speed", `⚡ ${fmtMs(mineMedian)}${mineMedian > limit ? " ⚠" : ""}`);
+		}
 		// A manual /model change means the user is driving: forget the session's switch.
 		if (switchTarget && current.id !== switchTarget) {
-			switchedThisSession = false;
+			switchCount = 0;
 			switchTarget = undefined;
 		}
-		if (!config.auto || switchedThisSession) return;
+		if (!config.auto || switchCount >= config.maxSwitchesPerSession) return;
 		// Hard stop for Fabric children: a switch here is read as model drift by the
 		// parent and ends the run (see FABRIC_CHILD above). `/speed-auto on` cannot undo it.
 		if (FABRIC_CHILD && !AUTO_IN_CHILD) return;
-		if (Date.now() - lastSwitchAt < config.cooldownMs) return;
-		const shared = await readSwitchState();
-		if (shared.lastSwitchAt && Date.now() - shared.lastSwitchAt < config.cooldownMs) return;
+		// Per *session* pacing: one session's switch must not freeze every other session,
+		// which is what the shared lastSwitchAt file used to do.
+		if (Date.now() - lastSwitchAt < config.switchCooldownMs) return;
 		if (config.providers.length > 0 && !config.providers.includes(current.provider)) return;
 
 		const streak = slowStreak();
 		if (!streak) return;
 
 		const ranked = await rankCandidates(ctx);
-		const currentMedian = median(streak.tail.map((s) => s.ttftMs!));
+		const currentMedian = definedMedian(streak.tail.map((s) => s.ttftMs));
+		const shared = await readSwitchState();
+		const history = Array.isArray(shared.history) ? shared.history : [];
+		// Anti ping-pong: do not jump back to a model this session just abandoned.
+		const recentlyLeft = (id: string) =>
+			history.some((entry) => entry?.from === id && typeof entry.at === "number" && Date.now() - entry.at < config.cooldownMs);
 		// A barely-faster model is not worth the prefix cache: require a clear win.
-		const best = ranked.candidates.find(
-			(candidate) =>
-				candidate.id !== current.id &&
-				candidate.ttftMs !== undefined &&
-				Number.isFinite(candidate.ttftMs) &&
+		const clearlyFaster = (candidate: Candidate) => {
+			if (candidate.id === current.id || typeof candidate.ttftMs !== "number" || !Number.isFinite(candidate.ttftMs)) return false;
+			if (recentlyLeft(candidate.id)) return false;
+			if (currentMedian === undefined) return true; // no TTFT to compare with: a measured fast model still wins
+			return (
 				candidate.ttftMs * config.sessionBinding.minImprovementRatio <= currentMedian &&
-				currentMedian - candidate.ttftMs >= config.sessionBinding.minImprovementMs,
-		);
+				currentMedian - candidate.ttftMs >= config.sessionBinding.minImprovementMs
+			);
+		};
+		const best = ranked.candidates.find(clearlyFaster);
 		const ttftMedian = fmtMs(currentMedian);
+		const wallNote = streak.tail.some((s) => s.longCall)
+			? `, ${streak.tail.filter((s) => s.longCall).length}/${streak.tail.length} hung (>15 min)`
+			: "";
 		const boundNote = streak.bound ? `, session bound (thresholds ×${config.sessionBinding.boundThresholdMultiplier})` : "";
 		if (!best) {
-			lastSwitchAt = Date.now();
-			await writeSwitchState({ lastSwitchAt });
-			ctx.ui.notify(
-				`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}${boundNote}), but no clearly faster same-provider model is known yet` +
-					describeExcluded(ranked.excluded, ranked.needTokens),
-				"warning",
-			);
+			// Do NOT burn the switch cooldown when nothing was switched: that used to silence
+			// failover for ten minutes after a mere notification.
+			if (Date.now() - lastNoTargetAt >= config.switchCooldownMs) {
+				lastNoTargetAt = Date.now();
+				ctx.ui.notify(
+					`[model-speed] ${current.id}: slow turns (median TTFT ${ttftMedian}${wallNote}${boundNote}), but no clearly faster same-provider model is known yet` +
+						describeExcluded(ranked.excluded, ranked.needTokens),
+					"warning",
+				);
+			}
 			return;
 		}
 		const target = ctx.modelRegistry.find(current.provider, best.id);
 		if (!target) return;
 		const switched = await pi.setModel(target);
-		lastSwitchAt = Date.now();
-		await writeSwitchState({ lastSwitchAt, lastFrom: current.id, lastTo: best.id });
 		if (!switched) return;
-		switchedThisSession = true;
+		lastSwitchAt = Date.now();
+		const at = lastSwitchAt;
+		await writeSwitchState({
+			lastSwitchAt: at,
+			lastFrom: current.id,
+			lastTo: best.id,
+			history: [...history, { from: current.id, to: best.id, at }].slice(-8),
+		});
+		switchCount += 1;
 		switchTarget = best.id;
 		ctx.ui.notify(
-			`[model-speed] ${current.id}: ${config.window} slow turns (median TTFT ${ttftMedian}${boundNote}) → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})`,
+			`[model-speed] ${current.id}: slow turns (median TTFT ${ttftMedian}${wallNote}${boundNote}) → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})` +
+				(switchCount > 1 ? ` [#${switchCount}/${config.maxSwitchesPerSession}]` : ""),
 			"warning",
 		);
 		await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason: "slow", bound: streak.bound, streak: streak.tail });
@@ -534,9 +642,10 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		samples = [];
 		pending = [];
-		switchedThisSession = false;
+		switchCount = 0;
 		switchTarget = undefined;
 		lastSwitchAt = 0;
+		lastNoTargetAt = 0;
 		turnCount = 0;
 		sessionStartedAt = Date.now();
 		config = await loadConfig();
@@ -545,7 +654,13 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const ranked = await rankCandidates(ctx);
 		if (ranked.candidates.length > 1) {
 			const fastest = ranked.candidates[0];
-			ctx.ui.setStatus("model-speed", `⚡ ${fastest.id}${fastest.ttftMs ? ` ${fmtMs(fastest.ttftMs)}` : ""}`);
+			// The footer already prints the current model id. Naming it again here was pure
+			// duplication; only a *different*, faster candidate is worth the pixels.
+			if (fastest.id !== ctx.model?.id && fastest.ttftMs) {
+				ctx.ui.setStatus("model-speed", `⚡ ${fastest.id} ${fmtMs(fastest.ttftMs)}`);
+			} else {
+				ctx.ui.setStatus("model-speed", undefined);
+			}
 		}
 		const probe = await readProbe();
 		const current = ctx.model;
