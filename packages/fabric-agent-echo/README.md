@@ -15,6 +15,8 @@ A `fabric_exec` program can spawn child agents (`agents.run`, `agents.spawn`, co
 
 Fabric spells out the run ID in every result, and you can inspect it live with `/fabric chat <runId>` (`ctrl+shift+a`) or the dashboard's *Topology · Run*. But that is a separate full-screen view: leave it, and there is nothing left in the transcript. Run artifacts are also temporary — one-shot runs are pruned after 24 hours by default (`retention.oneShotRunMs`).
 
+Runs are read from both places Fabric can put them: the per-process temporary root (`<tmp>/pi-fabric-runs-*/<runId>/`) and, when children keep their own session so they stay resumable (`agents.childSession`, see **pi-fabric-resume**), the session-keyed cache root (`~/.cache/pi-fabric/runs/<pi-session-id>/<runId>/`). Only this session's cache root is read.
+
 This extension closes that gap: when a run finishes, its conversation is appended to the main session as a compact card. `ctrl+o` expands it. The entry is a **TUI-only custom entry** (`pi.appendEntry`), so it is persisted with the session and can be re-read after `/resume`, but it is **never sent to the model** and costs no context.
 
 ## Install

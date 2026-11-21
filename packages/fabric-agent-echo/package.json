@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric-agent-echo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Keep completed pi-fabric subagent conversations in the main Pi transcript as collapsible, model-invisible entries.",
   "type": "module",
   "license": "MIT",
@@ -33,5 +33,8 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

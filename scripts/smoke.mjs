@@ -125,6 +125,34 @@ check("agent-echo: falls back when the transcript is gone", () => {
 	assert.deepEqual(buildTranscript(record, join(root, "nope", "status.json")), ["(events.jsonl was cleaned up or has expired)"]);
 });
 
+// resumable runs (agents.childSession) live under the cache, keyed by Pi session id
+const cacheBase = join(root, "cache", "pi-fabric", "runs");
+const cacheRun = (session, id, finishedAt) => {
+	const dir = join(cacheBase, session, id);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "status.json"), JSON.stringify({ id, status: "completed", name: `run ${id}`, startedAt: finishedAt - 1000, finishedAt }));
+	writeFileSync(
+		join(dir, "events.jsonl"),
+		JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `done ${id}` }] } }) + "\n",
+	);
+};
+const mineId = "1".repeat(32);
+const otherId = "2".repeat(32);
+cacheRun("session-a", mineId, 5000);
+cacheRun("session-b", otherId, 5000);
+
+check("agent-echo: finds resumable runs kept under the cache for this session only", () => {
+	const found = collectRuns({ pid: fakePid, tmpRoot, sessionId: "session-a", cacheBase, since: 0 }).map((run) => run.id);
+	assert.ok(found.includes(mineId));
+	assert.equal(found.includes(otherId), false);
+	const other = collectRuns({ pid: fakePid, tmpRoot, sessionId: "session-b", cacheBase, since: 0 }).map((run) => run.id);
+	assert.ok(other.includes(otherId));
+	assert.equal(other.includes(mineId), false);
+	// No session id: the cache root is not scanned at all (other sessions are not ours).
+	const none = collectRuns({ pid: fakePid, tmpRoot, cacheBase, since: 0 });
+	assert.equal(none.some((run) => run.id === mineId || run.id === otherId), false);
+});
+
 // -------------------------------------------------------------- hardening
 const npmDir = join(root, "node_modules");
 const fabDist = join(npmDir, "pi-fabric", "dist");
@@ -196,6 +224,34 @@ writeFileSync(
 		"  }",
 		"}",
 		"export { PiModelControl };",
+	].join("\n"),
+);
+
+const growDist = join(npmDir, "@llblab", "pi-grow-loop", "dist");
+mkdirSync(growDist, { recursive: true });
+writeFileSync(
+	join(npmDir, "@llblab", "pi-grow-loop", "package.json"),
+	JSON.stringify({ name: "@llblab/pi-grow-loop", type: "module" }),
+);
+// Upstream text of the grow-loop patches: the tool's execute prologue, the two
+// checkpoint sentences, and the stop guideline line.
+writeFileSync(
+	join(growDist, "index.js"),
+	[
+		"class GrowLoop {",
+		"        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {",
+		"            lastCtx = ctx;",
+		"        return { lastCtx };",
+		"    }",
+		"}",
+		"const guideline = [",
+		'            "To stop, do not call grow_loop; finish with a concise stop proof.",',
+		"];",
+		"const checkpoint = [already",
+		'                            ? `\\nTool grow_loop was already called this turn. Iteration #${nextIteration} remains scheduled; delay updated to ${delayMs / 1000}s`',
+		'                            : `\\nGrow Loop iteration #${nextIteration} deferred until idle, then scheduled after ${delayMs / 1000}s delay`,',
+		"];",
+		"export { GrowLoop, guideline, checkpoint };",
 	].join("\n"),
 );
 

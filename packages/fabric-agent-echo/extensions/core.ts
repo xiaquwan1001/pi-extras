@@ -3,15 +3,23 @@
  * locate this Pi process's Fabric run roots and turn a finished run's event stream
  * back into readable conversation lines.
  *
- * Fabric writes one temp root per Pi process:
- *   <os.tmpdir()>/pi-fabric-runs-<random>/
- *     .fabric-owner.json        { pid, ... }  -- owner of this root
- *     <runId>/status.json       run record (id, status, usage, logFile, ...)
- *     <runId>/events.jsonl      the child's RPC stream (message_end = full messages)
- *     <runId>/lifecycle.jsonl   pi.agent_start / agent_settled / tokens.usage
+ * Fabric writes runs in one of two places:
+ *
+ *   1. one temp root per Pi process (the default):
+ *        <os.tmpdir()>/pi-fabric-runs-<random>/
+ *          .fabric-owner.json        { pid, ... }  -- owner of this root
+ *          <runId>/status.json       run record (id, status, usage, logFile, ...)
+ *          <runId>/events.jsonl      the child's RPC stream (message_end = full messages)
+ *          <runId>/lifecycle.jsonl   pi.agent_start / agent_settled / tokens.usage
+ *
+ *   2. a persistent, session-keyed root, when `agents.childSession` keeps children
+ *      resumable across restarts (pi-fabric-resume / the local resume patch):
+ *        <cache>/pi-fabric/runs/<pi-session-id>/<runId>/…
+ *      There is no owner file — the directory name *is* the session id — so these
+ *      roots are only read for the session id this process was told it owns.
  */
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import os from "node:os";
 
 export const RUN_ROOT_RE = /^pi-fabric-runs-[A-Za-z0-9_-]+$/;
@@ -52,15 +60,37 @@ export const clip = (value: string, limit: number) =>
 
 export const oneLine = (value: string) => value.replace(/\s+/g, " ").trim();
 
+/**
+ * Base directory of the session-keyed run roots. Mirrors pi-fabric's own resolution:
+ * `PI_FABRIC_RESUME_ROOT`, else `$XDG_CACHE_HOME/pi-fabric/runs`, else `~/.cache/...`.
+ */
+export function resumableRunsBase(): string {
+	const configured = process.env.PI_FABRIC_RESUME_ROOT?.trim();
+	if (configured && isAbsolute(configured)) return configured;
+	const cache = process.env.XDG_CACHE_HOME?.trim();
+	const home = cache && isAbsolute(cache) ? cache : join(os.homedir(), ".cache");
+	return join(home, "pi-fabric", "runs");
+}
+
+/** The run root that holds one Pi session's resumable children. */
+export function resumableRunRoot(sessionId: string, base: string = resumableRunsBase()): string {
+	const safe = sessionId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 120);
+	return join(base, safe);
+}
+
 /** Run roots owned by this Pi process (more than one after a reload). */
-export function ownedRoots(pid: number = process.pid, tmpRoot: string = os.tmpdir()): string[] {
-	let names: string[];
+export function ownedRoots(
+	pid: number = process.pid,
+	tmpRoot: string = os.tmpdir(),
+	extra: string[] = [],
+): string[] {
+	const roots: string[] = [];
+	let names: string[] = [];
 	try {
 		names = readdirSync(tmpRoot);
 	} catch {
-		return [];
+		names = [];
 	}
-	const roots: string[] = [];
 	for (const name of names) {
 		if (!RUN_ROOT_RE.test(name)) continue;
 		const root = join(tmpRoot, name);
@@ -69,6 +99,13 @@ export function ownedRoots(pid: number = process.pid, tmpRoot: string = os.tmpdi
 			if (owner?.pid === pid) roots.push(root);
 		} catch {
 			/* not ours, or being written right now */
+		}
+	}
+	for (const root of extra) {
+		try {
+			if (existsSync(root) && statSync(root).isDirectory()) roots.push(root);
+		} catch {
+			/* vanished between listing and reading */
 		}
 	}
 	return roots;
@@ -163,6 +200,10 @@ export function buildTranscript(record: RunRecord, statusFile: string): string[]
 export type SweepOptions = {
 	pid?: number;
 	tmpRoot?: string;
+	/** This Pi session's id, when children keep resumable runs under the cache. */
+	sessionId?: string;
+	/** Override the resumable base directory (tests, unusual layouts). */
+	cacheBase?: string;
 	since?: number;
 	idFilter?: string;
 	skip?: (id: string) => boolean;
@@ -173,7 +214,8 @@ export function collectRuns(options: SweepOptions = {}): EchoData[] {
 	const cutoff = options.since ?? 0;
 	const out: EchoData[] = [];
 	const seen = new Set<string>();
-	for (const root of ownedRoots(options.pid, options.tmpRoot)) {
+	const extra = options.sessionId ? [resumableRunRoot(options.sessionId, options.cacheBase)] : [];
+	for (const root of ownedRoots(options.pid, options.tmpRoot, extra)) {
 		for (const statusFile of statusFiles(root)) {
 			const record = readRecord(statusFile);
 			if (!record) continue;

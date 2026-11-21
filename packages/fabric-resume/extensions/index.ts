@@ -52,6 +52,11 @@ export default function fabricResume(_pi: ExtensionAPI): void {
 		log("overlay disabled by PI_FABRIC_RESUME_PATCH");
 		return;
 	}
+	// A Fabric child process loads this extension too; it inherits the dist its parent
+	// already verified. Skipping keeps dispatch cheap and avoids writing dist from a
+	// short-lived worker (PI_FABRIC_DEPTH is set for every child of a Fabric run).
+	const depth = Number(process.env.PI_FABRIC_DEPTH ?? "");
+	if (Number.isFinite(depth) && depth >= 1) return;
 	let result: ReturnType<typeof applyResumeOverlay>;
 	try {
 		result = applyResumeOverlay({ packageRoot: packageRoot(), npmDir: piNpmDir() });

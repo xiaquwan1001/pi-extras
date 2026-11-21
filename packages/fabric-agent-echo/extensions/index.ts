@@ -2,7 +2,9 @@
  * fabric-agent-echo — keep completed Fabric subagent conversations in the main transcript.
  *
  * Why: Fabric stores a child run's conversation in its run directory
- * (`<os.tmpdir()>/pi-fabric-runs-<rand>/<runId>/events.jsonl`, retained 24h by default)
+ * (`<os.tmpdir()>/pi-fabric-runs-<rand>/<runId>/events.jsonl`, retained 24h by default —
+ * or `~/.cache/pi-fabric/runs/<pi-session-id>/<runId>/` when children keep their own
+ * session so they stay resumable)
  * and exposes it only through `/fabric chat <runId>` / the dashboard / `agents.log()`.
  * The main session keeps just the `fabric_exec` tool card and a one-line completion
  * notice, so once you scroll past it the subagent's work is gone from view.
@@ -30,6 +32,8 @@ const POLL_MS = 4000;
 const echoed = new Set<string>();
 let auto = process.env.PI_FABRIC_AGENT_ECHO !== "0";
 let since = 0;
+/** This session's id, so resumable runs kept under the cache are found too. */
+let sessionId: string | undefined;
 let timer: ReturnType<typeof setInterval> | undefined;
 let sweeping = false;
 
@@ -88,6 +92,7 @@ function sweep(pi: ExtensionAPI, opts: { since?: number; idFilter?: string } = {
 		since: opts.since ?? since,
 		idFilter: opts.idFilter,
 		skip: (id) => echoed.has(id),
+		...(sessionId ? { sessionId } : {}),
 	});
 	for (const data of runs) {
 		try {
@@ -134,6 +139,12 @@ export default function fabricAgentEcho(pi: ExtensionAPI) {
 			/* treat as empty */
 		}
 		since = Date.now();
+		try {
+			const id = ctx.sessionManager?.getSessionId?.();
+			sessionId = typeof id === "string" && id ? id : undefined;
+		} catch {
+			sessionId = undefined;
+		}
 		startTimer(pi);
 	});
 
