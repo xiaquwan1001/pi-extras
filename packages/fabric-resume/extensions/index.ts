@@ -66,9 +66,10 @@ export default function fabricResume(_pi: ExtensionAPI): void {
 			);
 			break;
 		case "already":
+			log(`already applied (${result.detail ?? ""})`);
 			break;
 		case "version-mismatch":
-			log(`skipped: ${result.detail}; rebuild the overlay for that release (packages/fabric-resume/patches/README.md)`);
+			log(`skipped: ${result.detail}; rebuild the overlay for that release (packages/fabric-resume/README.md)`);
 			break;
 		case "locked":
 			log("skipped: another Pi process is applying the overlay right now");
