@@ -16,7 +16,16 @@ Two details that make the numbers trustworthy rather than decorative:
 
 Samples stay in memory for `/speed-stats` and are appended to `~/.cache/pi-model-speed/speed-log.jsonl`, which later sessions use for ranking.
 
-**Slow-streak failover.** If the current model is slow — TTFT over the threshold *or* TPOT over the threshold, bucketed by prompt size — for `window` consecutive turns, the extension switches to the fastest **other model of the same provider**. It never crosses providers, because that changes pricing and capabilities behind your back.
+**Slow-streak failover.** If the current model is slow — TTFT over the threshold, TPOT over the threshold, or a turn whose wall clock exceeded `turnWallMs` (bucketed by prompt size) — for `window` of the last turns, the extension switches to the fastest **other model of the same provider**. It never crosses providers, because that changes pricing and capabilities behind your back.
+
+Staleness is judged per sample from the time it **ended** (`streakMaxAgeMs`), never from a sample's start. The earlier rule dropped the whole streak as soon as any sample had started more than `cooldownMs` ago, which is always true when turns take minutes — so failover was dead on exactly the gateways it exists for (limbus lane U, 2026-11-23: TTFT 147 s / 130 s / 904 s / 303 s on `ustc-dsf`, never switched, 73 minutes burned). `tests/streak.test.mjs` replays those samples.
+
+**A hung request is not a slow turn.** `turn_end` never fires while a request is stuck, so a gateway that accepts the call and then sends nothing used to hang the session until Pi's HTTP idle timeout — and the retry landed on the same model. A stall timer is armed at `before_provider_request`:
+
+- no first token for `thresholds.stallMs` (default 3 min) → log a `stall` line, notify, and switch to the fastest measured model under the same guards as a slow streak;
+- still nothing after a second window → `ctx.abort()`, so the turn reports an abort instead of silence. For an async subagent that abort is also what wakes the parent up, instead of an hour with no news.
+
+The timer is cleared on the first payload delta and at `message_end`/`turn_end`, so a slow-but-streaming turn is left to the streak logic.
 
 Guards: once per `cooldownMs`, at most once per session, skipped while a manual `/model` is driving, the target must **clearly** be faster (`minImprovementRatio` / `minImprovementMs`) — a 13 s → 12 s "win" is not worth re-billing the prompt — and the target must **fit the session's context** (see below).
 
@@ -24,7 +33,9 @@ Guards: once per `cooldownMs`, at most once per session, skipped while a manual 
 
 **A warm session is expensive to leave.** Switching models discards the gateway's prefix cache and re-pays for the whole prompt, so a session that has already run `sessionBinding.warmTurns` turns (or `warmAfterMs` of wall time, or one turn whose prompt is past `thresholds.largePromptTokens`) is *bound*: its slow thresholds are multiplied by `boundThresholdMultiplier`, TTFT never triggers a switch below `boundMinTtftMs`, and the switch log/notification says `session bound`. A bound session stays on a model that is 20% slower, and still walks away from one that stalls for a minute.
 
-**Never inside a Fabric child.** A process launched by `fabric_exec` (it carries `PI_FABRIC_LINEAGE` / `PI_FABRIC_DEPTH`) keeps the model its parent assigned: Pi Fabric's model admission reads a mid-run switch as drift. Sampling still runs there, so child timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging.
+**Never inside a Fabric child.** A process launched by `fabric_exec` (it carries `PI_FABRIC_LINEAGE` / `PI_FABRIC_DEPTH`) keeps the model its parent assigned: Pi Fabric's model admission reads a mid-run switch as drift. Sampling still runs there, so child timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging. The abort half of the stall watchdog still applies: it ends the turn, it does not change the model.
+
+**Where it runs.** Ambient extensions load in the parent session and in *background* subagent children (`async: true`), which is where the stall watchdog earns its keep. Local *foreground* children (`async: false`) never load ambient extensions, so neither sampling nor failover happens there; opt in per agent with `subagentOnlyExtensions` when you need it.
 
 ## Install
 
@@ -57,9 +68,12 @@ Optional file `~/.pi/agent/model-speed.json`:
     "ttftSmallMs": 12000,
     "ttftLargeMs": 25000,
     "largePromptTokens": 30000,
-    "tpotMs": 250
+    "tpotMs": 250,
+    "turnWallMs": 90000,
+    "stallMs": 180000
   },
   "window": 3,
+  "streakMaxAgeMs": 1800000,
   "cooldownMs": 600000,
   "sessionBinding": {
     "warmTurns": 3,
@@ -88,8 +102,14 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `thresholds.ttftSmallMs` | `12000` | Slow TTFT for prompts under `largePromptTokens` |
 | `thresholds.ttftLargeMs` | `25000` | Slow TTFT for large prompts (long prompts legitimately take longer) |
 | `thresholds.tpotMs` | `250` | Slow output rate (≈4 tokens/s) |
+| `thresholds.turnWallMs` | `90000` | A turn that took longer than this is slow regardless of TTFT |
+| `thresholds.stallMs` | `180000` | No first token for this long = hung request: notify + switch; a second window aborts the turn (`PI_MODEL_SPEED_STALL_MS`, `0` disables) |
 | `window` | `3` | Consecutive slow turns before switching |
-| `cooldownMs` | `600000` | Do not switch more often than this |
+| `minSlowInWindow` | `2` | How many of those `window` turns must be slow |
+| `streakMaxAgeMs` | `1800000` | A sample older than this (by end time) leaves the streak (`PI_MODEL_SPEED_STREAK_MAX_AGE_MS`) |
+| `switchCooldownMs` | `180000` | Minimum gap between switches inside one session |
+| `maxSwitchesPerSession` | `3` | A session may step off more than once |
+| `cooldownMs` | `600000` | Ping-pong window: never switch back to a model just left |
 | `sessionBinding.warmTurns` | `3` | Turns after which the session counts as bound (prefix cache already paid) |
 | `sessionBinding.warmAfterMs` | `600000` | …or this much wall time into the session |
 | `sessionBinding.boundThresholdMultiplier` | `3` | Bound sessions use `thresholds` × this |
@@ -101,13 +121,28 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `probe.command` | — | Optional external probe, run by `/speed` and never automatically |
 | `probe.file` | — | That probe's output: `{ "ts": 1700000000, "models": { "<id>": { "ok": true, "ttft": 1.2 } } }` (`ttft` in seconds) |
 
-Environment overrides: `PI_MODEL_SPEED=0` (disable), `PI_MODEL_SPEED_DIR` (state dir), `PI_MODEL_SPEED_CONFIG` (config path), `PI_MODEL_SPEED_SLOW_MS`, `PI_MODEL_SPEED_SLOW_LARGE_MS`, `PI_MODEL_SPEED_SLOW_TPOT_MS`, `PI_MODEL_SPEED_WINDOW`, `PI_MODEL_SPEED_CONTEXT_GUARD=0`.
+Environment overrides: `PI_MODEL_SPEED=0` (disable), `PI_MODEL_SPEED_DIR` (state dir), `PI_MODEL_SPEED_CONFIG` (config path), `PI_MODEL_SPEED_SLOW_MS`, `PI_MODEL_SPEED_SLOW_LARGE_MS`, `PI_MODEL_SPEED_SLOW_TPOT_MS`, `PI_MODEL_SPEED_SLOW_WALL_MS`, `PI_MODEL_SPEED_STALL_MS`, `PI_MODEL_SPEED_STREAK_MAX_AGE_MS`, `PI_MODEL_SPEED_WINDOW`, `PI_MODEL_SPEED_CONTEXT_GUARD=0`.
 
 ## Choosing a ranking source
 
 Ranking uses, in order: the probe file (an out-of-band measurement, e.g. a cron job), then this extension's own sample history (median TTFT per model from `speed-log.jsonl`), then "unknown". Unknown models are never picked as a switch target — the extension says "no faster same-provider model is known yet" and leaves you where you are.
 
 The probe is deliberately *not* part of the package: timing a model means spending tokens at *your* provider, and every gateway has its own way to do that. If you have one, point `probe.command` at it.
+
+## Diagnosing "why didn't it switch?"
+
+`speed-log.jsonl` (in `~/.cache/pi-model-speed/`) carries everything needed after the fact:
+
+| `kind` | Meaning |
+| --- | --- |
+| `sample` | One timed request (TTFT/TPOT, prompt tokens, `longCall` for hangs) |
+| `stall` | A request produced no first token for `stallMs` (`attempt` 1 = notify+switch, 2 = abort) |
+| `switch` | The switch that happened (`from`/`to`, `reason` = `slow` or `stall`) |
+| `switch-skip` | Why it did **not** happen: `auto off`, `switch budget spent`, `switch cooldown`, `provider … not in allowlist`, `fabric child`, `target … missing from registry`, `setModel(…) refused`, or `no clearly faster same-provider target` — the last one also logs the ranking it saw (`ranked`, `excluded`, `needTokens`, `currentMedian`) |
+
+```bash
+node --test packages/model-speed/tests/   # failover decision, replayed from real samples
+```
 
 ## Notes and limits
 

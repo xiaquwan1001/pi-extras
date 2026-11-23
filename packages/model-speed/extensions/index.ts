@@ -24,6 +24,15 @@
  * Ranking sources, in order: an optional external probe file (e.g. a cron job that
  * times each model), then this extension's own sample history, then registry order.
  *
+ * **A hung request is not a slow turn.** `turn_end` never fires while a request is
+ * stuck, so a gateway that accepts the call and then streams nothing used to hang the
+ * session until Pi's HTTP idle timeout (20 min here) — twice, because the retry lands on
+ * the same model. A stall timer armed at `before_provider_request` fires after
+ * `thresholds.stallMs` without a first token: it logs the stall, switches to the
+ * fastest measured model (same rules as a slow streak), and aborts the turn when a
+ * second window also passes with nothing. Aborting ends the turn instead of silence,
+ * which is also what wakes an async subagent's parent up.
+ *
  * **Speed is only half of "is this model a valid target".** A candidate must also be
  * able to hold the context the session already has: a provider that offers a fast
  * 256k model next to a slow 1M one will otherwise hand a 300k-token session the 256k
@@ -39,9 +48,10 @@
  *   "auto": true,
  *   "providers": [],          // providers where switching is allowed; [] = any provider with 2+ models
  *   "candidates": [],         // model ids or "provider/id" to consider; [] = every model of the provider
- *   "thresholds": { "ttftSmallMs": 12000, "ttftLargeMs": 25000, "largePromptTokens": 30000, "tpotMs": 250, "turnWallMs": 90000 },
+ *   "thresholds": { "ttftSmallMs": 12000, "ttftLargeMs": 25000, "largePromptTokens": 30000, "tpotMs": 250, "turnWallMs": 90000, "stallMs": 180000 },
  *   "window": 3,
  *   "minSlowInWindow": 2,        // how many of the last `window` samples must be slow
+ *   "streakMaxAgeMs": 1800000,  // a sample older than this (by end time) leaves the streak
  *   "switchCooldownMs": 180000,  // min gap between switches *in one session*
  *   "maxSwitchesPerSession": 3,  // a session may step off more than once
  *   "cooldownMs": 600000,        // ping-pong window: don't go back to a model just left
@@ -93,7 +103,7 @@ const LOG_MAX_BYTES = 4 * 1024 * 1024;
 const LOG_TAIL_BYTES = 512 * 1024;
 const SWITCH_STATE = join(STATE_DIR, "switch-state.json");
 
-type Thresholds = { ttftSmallMs: number; ttftLargeMs: number; largePromptTokens: number; tpotMs: number; turnWallMs: number };
+type Thresholds = { ttftSmallMs: number; ttftLargeMs: number; largePromptTokens: number; tpotMs: number; turnWallMs: number; stallMs: number };
 type SessionBinding = {
 	warmTurns: number;
 	warmAfterMs: number;
@@ -110,6 +120,7 @@ type Config = {
 	thresholds: Thresholds;
 	window: number;
 	minSlowInWindow: number;
+	streakMaxAgeMs: number;
 	switchCooldownMs: number;
 	maxSwitchesPerSession: number;
 	cooldownMs: number;
@@ -127,9 +138,10 @@ const DEFAULT_CONFIG: Config = {
 	auto: process.env.PI_MODEL_SPEED !== "0" && !(FABRIC_CHILD && !AUTO_IN_CHILD),
 	providers: [],
 	candidates: [],
-	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250, turnWallMs: 90_000 },
+	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250, turnWallMs: 90_000, stallMs: 180_000 },
 	window: 3,
 	minSlowInWindow: 2,
+	streakMaxAgeMs: 1_800_000,
 	switchCooldownMs: 180_000,
 	maxSwitchesPerSession: 3,
 	cooldownMs: 600_000,
@@ -179,6 +191,12 @@ let switchTarget: string | undefined;
 let lastNoTargetAt = 0;
 let sessionStartedAt = 0;
 let turnCount = 0;
+/** Stall watchdog state: one timer for the request in flight, one context for its session. */
+let stallTimer: ReturnType<typeof setTimeout> | undefined;
+let stallFired = 0;
+let liveCtx: ExtensionContext | undefined;
+let liveApi: ExtensionAPI | undefined;
+let disposed = false;
 
 async function loadConfig(): Promise<Config> {
 	let raw: Record<string, any> = {};
@@ -201,9 +219,15 @@ async function loadConfig(): Promise<Config> {
 			largePromptTokens: num(thresholds.largePromptTokens, 30_000),
 			tpotMs: envThreshold("PI_MODEL_SPEED_SLOW_TPOT_MS", num(thresholds.tpotMs, 250)),
 			turnWallMs: envThreshold("PI_MODEL_SPEED_SLOW_WALL_MS", num(thresholds.turnWallMs, 90_000)),
+			// Unlike the slow thresholds, 0 is meaningful here: it disables the watchdog.
+			stallMs: (() => {
+				const n = Number(process.env.PI_MODEL_SPEED_STALL_MS ?? raw.thresholds?.stallMs ?? thresholds.stallMs);
+				return Number.isFinite(n) && n >= 0 ? n : DEFAULT_CONFIG.thresholds.stallMs;
+			})(),
 		},
 		window,
 		minSlowInWindow: Math.min(window, Math.max(1, Math.floor(num(raw.minSlowInWindow, DEFAULT_CONFIG.minSlowInWindow)))),
+		streakMaxAgeMs: num(process.env.PI_MODEL_SPEED_STREAK_MAX_AGE_MS, num(raw.streakMaxAgeMs, DEFAULT_CONFIG.streakMaxAgeMs)),
 		switchCooldownMs: num(raw.switchCooldownMs, DEFAULT_CONFIG.switchCooldownMs),
 		maxSwitchesPerSession: Math.max(1, Math.floor(num(raw.maxSwitchesPerSession, DEFAULT_CONFIG.maxSwitchesPerSession))),
 		cooldownMs: num(raw.cooldownMs, DEFAULT_CONFIG.cooldownMs),
@@ -429,36 +453,204 @@ function sessionBound(): boolean {
 	return false;
 }
 
-/** The last `window` usable samples, if enough of them were slow and recent. */
-function slowStreak(): { tail: Sample[]; bound: boolean } | null {
-	const usable = samples.filter((s) => !s.error && (s.ttftMs !== undefined || s.endedAt !== undefined));
-	if (usable.length < config.window) return null;
-	const tail = usable.slice(-config.window);
-	const now = Date.now();
-	if (tail.some((s) => now - s.startedAt > config.cooldownMs)) return null;
-	const bound = sessionBound();
-	const multiplier = bound ? config.sessionBinding.boundThresholdMultiplier : 1;
+/**
+ * Evaluate a slow streak. Pure so the failover decision stays testable:
+ * `tests/streak.test.mjs` replays the samples of a real stuck lane.
+ */
+export function evaluateStreak(
+	usable: Sample[],
+	cfg: Config,
+	bound: boolean,
+	now = Date.now(),
+): { tail: Sample[]; slowCount: number } | null {
+	// Age is measured from when a sample *ended*, and per sample rather than per streak.
+	// The old rule (`any startedAt older than cooldownMs` ⇒ no streak at all) disabled
+	// failover on exactly the gateways it was written for: three slow turns there span
+	// more than ten minutes, so every streak looked stale. limbus lane U, 2026-11-23:
+	// TTFT 147s/130s/904s/303s/328s on ustc-dsf — never switched, 73 minutes burned.
+	const recent = usable.filter((s) => now - (s.endedAt ?? s.startedAt) <= cfg.streakMaxAgeMs);
+	if (recent.length < cfg.window) return null;
+	const tail = recent.slice(-cfg.window);
+	const multiplier = bound ? cfg.sessionBinding.boundThresholdMultiplier : 1;
 	let slowCount = 0;
 	for (const sample of tail) {
 		const prompt = sample.promptTokens ?? 0;
-		const promptLimit = prompt >= config.thresholds.largePromptTokens ? config.thresholds.ttftLargeMs : config.thresholds.ttftSmallMs;
+		const promptLimit = prompt >= cfg.thresholds.largePromptTokens ? cfg.thresholds.ttftLargeMs : cfg.thresholds.ttftSmallMs;
 		// Bound sessions get a widened band, and an absolute floor: a 14 s TTFT on a warm
 		// 200k-token session is normal, a 60 s+ one is not.
 		const ttftLimit = bound
-			? Math.max(promptLimit * multiplier, config.sessionBinding.boundMinTtftMs)
+			? Math.max(promptLimit * multiplier, cfg.sessionBinding.boundMinTtftMs)
 			: promptLimit * multiplier;
-		const tpotLimit = config.thresholds.tpotMs * multiplier;
+		const tpotLimit = cfg.thresholds.tpotMs * multiplier;
 		const slowTtft = (sample.ttftMs ?? 0) > ttftLimit;
 		const slowTpot = (sample.tpotMs ?? 0) > tpotLimit;
 		// Wall clock is what the user actually waits for: a streaming reply at 40 tok/s that
 		// takes four minutes is slow even though its TTFT looked fine. Not multiplied — this
 		// is the "I am still waiting" signal, not a per-token nicety.
 		const wall = sample.endedAt !== undefined ? sample.endedAt - sample.startedAt : 0;
-		const slowWall = wall > config.thresholds.turnWallMs;
+		const slowWall = wall > cfg.thresholds.turnWallMs;
 		if (slowTtft || slowTpot || slowWall) slowCount += 1;
 	}
-	if (slowCount < config.minSlowInWindow) return null;
-	return { tail, bound };
+	if (slowCount < cfg.minSlowInWindow) return null;
+	return { tail, slowCount };
+}
+
+/** The last `window` usable samples, if enough of them were slow and recent. */
+function slowStreak(): { tail: Sample[]; bound: boolean } | null {
+	const usable = samples.filter((s) => !s.error && (s.ttftMs !== undefined || s.endedAt !== undefined));
+	if (usable.length < config.window) return null;
+	const bound = sessionBound();
+	const result = evaluateStreak(usable, config, bound);
+	return result ? { tail: result.tail, bound } : null;
+}
+
+/**
+ * Move to a clearly faster same-provider model. Shared by the slow-streak path
+ * (`turn_end`) and the stall path (a request that sent no first token at all), so both
+ * obey the same guards: auto on, per-session switch budget, switch cooldown, provider
+ * allowlist, anti ping-pong, and "clearly faster" — plus the context-window check that
+ * `rankCandidates` already applied.
+ */
+async function switchToFaster(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	streak: { tail: Sample[]; bound: boolean },
+	reason: "slow" | "stall" = "slow",
+): Promise<boolean> {
+	const current = ctx.model;
+	// Every exit is logged: "the failover did not fire" is the question asked after every
+	// slow session, and answering it from the log beats re-reading the code.
+	const skip = async (why: string, extra: Record<string, unknown> = {}): Promise<false> => {
+		await appendLog({ kind: "switch-skip", pid: process.pid, reason: why, trigger: reason, model: current?.id ?? "?", ...extra });
+		return false;
+	};
+	if (!current) return skip("no current model");
+	if (!config.auto) return skip("auto off");
+	if (switchCount >= config.maxSwitchesPerSession) return skip(`switch budget spent (${switchCount}/${config.maxSwitchesPerSession})`);
+	// Hard stop for Fabric children: a switch here is read as model drift by the
+	// parent and ends the run (see FABRIC_CHILD above). `/speed-auto on` cannot undo it.
+	if (FABRIC_CHILD && !AUTO_IN_CHILD) return skip("fabric child");
+	// Per *session* pacing: one session's switch must not freeze every other session,
+	// which is what the shared lastSwitchAt file used to do.
+	if (Date.now() - lastSwitchAt < config.switchCooldownMs) return skip("switch cooldown");
+	if (config.providers.length > 0 && !config.providers.includes(current.provider)) return skip(`provider ${current.provider} not in allowlist`);
+
+	const ranked = await rankCandidates(ctx);
+	const currentMedian = definedMedian(streak.tail.map((s) => s.ttftMs));
+	const shared = await readSwitchState();
+	const history = Array.isArray(shared.history) ? shared.history : [];
+	// Anti ping-pong: do not jump back to a model this session just abandoned.
+	const recentlyLeft = (id: string) =>
+		history.some((entry) => entry?.from === id && typeof entry.at === "number" && Date.now() - entry.at < config.cooldownMs);
+	// A barely-faster model is not worth the prefix cache: require a clear win.
+	const clearlyFaster = (candidate: Candidate) => {
+		if (candidate.id === current.id || typeof candidate.ttftMs !== "number" || !Number.isFinite(candidate.ttftMs)) return false;
+		if (recentlyLeft(candidate.id)) return false;
+		if (currentMedian === undefined) return true; // no TTFT to compare with: a measured fast model still wins
+		// A stall has no TTFT to beat — the current model produced nothing for `waited`. Any
+		// model with a measured first token *inside* that wait is already the better bet, and
+		// the usual ratio gates would compare a wait against a TTFT and reject everything.
+		if (reason === "stall") return candidate.ttftMs < currentMedian;
+		return (
+			candidate.ttftMs * config.sessionBinding.minImprovementRatio <= currentMedian &&
+			currentMedian - candidate.ttftMs >= config.sessionBinding.minImprovementMs
+		);
+	};
+	const best = ranked.candidates.find(clearlyFaster);
+	const wallNote = streak.tail.some((s) => s.longCall)
+		? `, ${streak.tail.filter((s) => s.longCall).length}/${streak.tail.length} hung (>15 min)`
+		: "";
+	const boundNote = streak.bound ? `, session bound (thresholds ×${config.sessionBinding.boundThresholdMultiplier})` : "";
+	const state =
+		reason === "stall"
+			? `stalled (no first token for ${fmtMs(currentMedian)}${boundNote})`
+			: `slow turns (median TTFT ${fmtMs(currentMedian)}${wallNote}${boundNote})`;
+	if (!best) {
+		// Do NOT burn the switch cooldown when nothing was switched: that used to silence
+		// failover for ten minutes after a mere notification.
+		if (Date.now() - lastNoTargetAt >= config.switchCooldownMs) {
+			lastNoTargetAt = Date.now();
+			ctx.ui.notify(
+				`[model-speed] ${current.id}: ${state}, but no clearly faster same-provider model is known yet` +
+					describeExcluded(ranked.excluded, ranked.needTokens),
+				"warning",
+			);
+		}
+		return skip("no clearly faster same-provider target", {
+			ranked: ranked.candidates.map((c) => `${c.id}=${c.ttftMs === undefined ? "?" : Math.round(c.ttftMs)}ms/${c.source}`),
+			excluded: ranked.excluded.map((e) => `${e.id}<${e.contextWindow}`),
+			needTokens: ranked.needTokens,
+			currentMedian,
+		});
+	}
+	const target = ctx.modelRegistry.find(current.provider, best.id);
+	if (!target) return skip(`target ${best.id} missing from registry`);
+	const switched = await pi.setModel(target);
+	if (!switched) return skip(`setModel(${best.id}) refused`);
+	lastSwitchAt = Date.now();
+	const at = lastSwitchAt;
+	await writeSwitchState({
+		lastSwitchAt: at,
+		lastFrom: current.id,
+		lastTo: best.id,
+		history: [...history, { from: current.id, to: best.id, at }].slice(-8),
+	});
+	switchCount += 1;
+	switchTarget = best.id;
+	ctx.ui.notify(
+		`[model-speed] ${current.id}: ${state} → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})` +
+			(switchCount > 1 ? ` [#${switchCount}/${config.maxSwitchesPerSession}]` : ""),
+		"warning",
+	);
+	await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason, bound: streak.bound, streak: streak.tail });
+	return true;
+}
+
+/** No first token for `thresholds.stallMs` is a hung gateway, and `turn_end` will never fire. */
+function clearStall(): void {
+	if (stallTimer !== undefined) {
+		clearTimeout(stallTimer);
+		stallTimer = undefined;
+	}
+}
+
+function armStall(): void {
+	clearStall();
+	if (disposed || config.thresholds.stallMs <= 0) return;
+	stallTimer = setTimeout(() => {
+		stallTimer = undefined;
+		void onStall();
+	}, config.thresholds.stallMs);
+	// Never hold the process open for a watchdog.
+	(stallTimer as { unref?: () => void }).unref?.();
+}
+
+async function onStall(): Promise<void> {
+	const ctx = liveCtx;
+	const pi = liveApi;
+	const sample = pending[pending.length - 1];
+	if (disposed || !ctx || !pi || !sample || sample.ttftMs !== undefined) return;
+	const waited = Date.now() - sample.startedAt;
+	stallFired += 1;
+	await appendLog({ kind: "stall", pid: process.pid, model: sample.model, provider: sample.provider, waitedMs: waited, attempt: stallFired });
+	if (stallFired === 1) {
+		ctx.ui.notify(`[model-speed] ${sample.model}: no first token for ${fmtMs(waited)} (hung gateway, not slow)`, "warning");
+		// A hung request cannot be sped up, but the next one can move: switch now so the
+		// retry (or the following turn) leaves the dead model instead of re-paying the wait.
+		await switchToFaster(pi, ctx, { tail: [{ ...sample, ttftMs: waited }], bound: sessionBound() }, "stall");
+		armStall();
+		return;
+	}
+	// Still nothing after a second window: stop silently waiting out Pi's HTTP idle timeout
+	// (20 min here). Aborting ends the turn — for an async subagent that is also what wakes
+	// the parent up, instead of an hour of silence.
+	ctx.ui.notify(`[model-speed] ${sample.model}: still no first token after ${fmtMs(waited)}; aborting this turn so the run reports instead of hanging`, "error");
+	clearStall();
+	try {
+		ctx.abort();
+	} catch {
+		/* not every mode allows it */
+	}
 }
 
 function probeSupported(): boolean {
@@ -480,6 +672,8 @@ function runProbe(): Promise<string> {
 }
 
 export default function modelSpeed(pi: ExtensionAPI) {
+	// The watchdog runs from a timer, outside every hook closure, so it needs the API too.
+	liveApi = pi;
 	// Load config immediately so pre-session events already see it; session_start reloads it.
 	void loadConfig().then((loaded) => {
 		config = loaded;
@@ -492,6 +686,11 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	pi.on("before_provider_request", async (_event, ctx) => {
 		pending.push({ model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", startedAt: Date.now() });
 		if (pending.length > 8) pending.shift();
+		// Arm the stall watchdog: if no token arrives, `turn_end` never fires and nothing else
+		// in this extension gets a chance to act on a hung gateway.
+		liveCtx = ctx;
+		stallFired = 0;
+		armStall();
 	});
 
 	pi.on("after_provider_response", async (event) => {
@@ -516,11 +715,13 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		if (!isPayload) return;
 		const elapsed = Date.now() - current.startedAt;
 		if (elapsed >= 20) current.ttftMs = elapsed; // <20ms is hook ordering, not a real TTFT
+		if (current.ttftMs !== undefined) clearStall();
 	});
 
 	pi.on("message_end", async (event) => {
 		const message = (event as any).message;
 		if (message?.role !== "assistant") return;
+		clearStall();
 		const sample = pending.shift();
 		if (!sample) return;
 		sample.endedAt = Date.now();
@@ -551,6 +752,8 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	// ---- slow-streak failover --------------------------------------------
 	pi.on("turn_end", async (_event, ctx) => {
 		turnCount += 1;
+		clearStall();
+		stallFired = 0;
 		const current = ctx.model;
 		if (!current) return;
 		// Status line = this model's own recent TTFT, no id: the footer already names the
@@ -568,74 +771,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 			switchCount = 0;
 			switchTarget = undefined;
 		}
-		if (!config.auto || switchCount >= config.maxSwitchesPerSession) return;
-		// Hard stop for Fabric children: a switch here is read as model drift by the
-		// parent and ends the run (see FABRIC_CHILD above). `/speed-auto on` cannot undo it.
-		if (FABRIC_CHILD && !AUTO_IN_CHILD) return;
-		// Per *session* pacing: one session's switch must not freeze every other session,
-		// which is what the shared lastSwitchAt file used to do.
-		if (Date.now() - lastSwitchAt < config.switchCooldownMs) return;
-		if (config.providers.length > 0 && !config.providers.includes(current.provider)) return;
-
 		const streak = slowStreak();
 		if (!streak) return;
-
-		const ranked = await rankCandidates(ctx);
-		const currentMedian = definedMedian(streak.tail.map((s) => s.ttftMs));
-		const shared = await readSwitchState();
-		const history = Array.isArray(shared.history) ? shared.history : [];
-		// Anti ping-pong: do not jump back to a model this session just abandoned.
-		const recentlyLeft = (id: string) =>
-			history.some((entry) => entry?.from === id && typeof entry.at === "number" && Date.now() - entry.at < config.cooldownMs);
-		// A barely-faster model is not worth the prefix cache: require a clear win.
-		const clearlyFaster = (candidate: Candidate) => {
-			if (candidate.id === current.id || typeof candidate.ttftMs !== "number" || !Number.isFinite(candidate.ttftMs)) return false;
-			if (recentlyLeft(candidate.id)) return false;
-			if (currentMedian === undefined) return true; // no TTFT to compare with: a measured fast model still wins
-			return (
-				candidate.ttftMs * config.sessionBinding.minImprovementRatio <= currentMedian &&
-				currentMedian - candidate.ttftMs >= config.sessionBinding.minImprovementMs
-			);
-		};
-		const best = ranked.candidates.find(clearlyFaster);
-		const ttftMedian = fmtMs(currentMedian);
-		const wallNote = streak.tail.some((s) => s.longCall)
-			? `, ${streak.tail.filter((s) => s.longCall).length}/${streak.tail.length} hung (>15 min)`
-			: "";
-		const boundNote = streak.bound ? `, session bound (thresholds ×${config.sessionBinding.boundThresholdMultiplier})` : "";
-		if (!best) {
-			// Do NOT burn the switch cooldown when nothing was switched: that used to silence
-			// failover for ten minutes after a mere notification.
-			if (Date.now() - lastNoTargetAt >= config.switchCooldownMs) {
-				lastNoTargetAt = Date.now();
-				ctx.ui.notify(
-					`[model-speed] ${current.id}: slow turns (median TTFT ${ttftMedian}${wallNote}${boundNote}), but no clearly faster same-provider model is known yet` +
-						describeExcluded(ranked.excluded, ranked.needTokens),
-					"warning",
-				);
-			}
-			return;
-		}
-		const target = ctx.modelRegistry.find(current.provider, best.id);
-		if (!target) return;
-		const switched = await pi.setModel(target);
-		if (!switched) return;
-		lastSwitchAt = Date.now();
-		const at = lastSwitchAt;
-		await writeSwitchState({
-			lastSwitchAt: at,
-			lastFrom: current.id,
-			lastTo: best.id,
-			history: [...history, { from: current.id, to: best.id, at }].slice(-8),
-		});
-		switchCount += 1;
-		switchTarget = best.id;
-		ctx.ui.notify(
-			`[model-speed] ${current.id}: slow turns (median TTFT ${ttftMedian}${wallNote}${boundNote}) → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})` +
-				(switchCount > 1 ? ` [#${switchCount}/${config.maxSwitchesPerSession}]` : ""),
-			"warning",
-		);
-		await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason: "slow", bound: streak.bound, streak: streak.tail });
+		await switchToFaster(pi, ctx, streak, "slow");
 	});
 
 	// ---- startup ----------------------------------------------------------
@@ -648,6 +786,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		lastNoTargetAt = 0;
 		turnCount = 0;
 		sessionStartedAt = Date.now();
+		disposed = false;
+		stallFired = 0;
+		clearStall();
 		config = await loadConfig();
 		if (event.reason === "reload") return;
 
@@ -765,6 +906,8 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		disposed = true;
+		clearStall();
 		if (samples.length) await appendLog({ kind: "session-end", samples: samples.length });
 	});
 }
