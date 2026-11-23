@@ -2,6 +2,8 @@
 
 Runtime hardening for [pi-fabric](https://github.com/fabric-runtime/pi-fabric) (and [pi-fold](https://pi.dev/packages/pi-fold)), as an extension instead of a fork.
 
+> **现状（2026-11-21）**：pi-fabric 已本机卸载，下面的 pi-fabric 补丁全部**静默跳过**（package absent → `skipped: missing`）。这个包仍装着是因为它还有 4 条活补丁：`pi-fold` 的 evidence-no-session-guard，`@llblab/pi-grow-loop` 的 state-visible / state-guideline（以及按 `PI_SUBAGENT_CHILD` 拦截子代理续轮的职责——那一条现由 `~/.pi/agent/extensions/pi-loop-switch.ts` 负责，本包的 child-guard 只看 `PI_FABRIC_*`，对 pi-subagents 子进程不生效）。fabric 卸后本包的 `tmpdir.ts`（TMPDIR 迁出小 tmpfs）也不再需要，但无害。
+
 ## Why this exists
 
 Every fix here comes from a real incident where Fabric's failure mode was worse than its bug:
