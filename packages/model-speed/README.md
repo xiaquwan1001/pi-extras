@@ -7,14 +7,25 @@ Measure what your model provider actually delivers, and get off a model that is 
 **Sampling.** Every model request is timed:
 
 - **TTFT** — `before_provider_request` → first content delta (reported in the status line and commands),
-- **TPOT** — ms per output token, derived from `message_end` usage.
+- **TPOT** — ms per output token, derived from `message_end` usage,
+- **tokens/s** — the inverse of TPOT, which is the number users actually feel during a long answer.
 
 Two details that make the numbers trustworthy rather than decorative:
 
 - The anchor is `before_provider_request`, not `message_start`. `message_start` fires after the response headers, so counting from it reports a TTFT of ~0 for every request.
 - Timings are queued, so overlapping requests (retries, nested calls, compaction) do not clobber each other.
 
-Samples stay in memory for `/speed-stats` and are appended to `~/.cache/pi-model-speed/speed-log.jsonl`, which later sessions use for ranking.
+Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl`, and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed-stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
+
+**The pool is sampled automatically.** Real turns only measure the model in use, so a model nobody selected would stay unmeasured forever. When the session has been idle for `sampling.idleMs` and a model's newest synthetic sample is older than `sampling.intervalMs`, the extension sends one small timed request through `ctx.modelRegistry.streamSimple()` — the same credentials Pi uses, so no probe script and no API key in a config file — and records TTFT plus tokens/s as a `kind:"probe"` line. Details that keep this honest and cheap:
+
+- a random tag at the front of the prompt, so a gateway prefix cache cannot fake a 0.3 s TTFT;
+- sequential calls with a small gap: concurrent requests to one gateway queue and skew the numbers;
+- the stalest models first, capped by `sampling.maxModels` (default 4) per run;
+- a lease file plus the idle check, so two open sessions never double the spend;
+- a real turn aborts in-flight samples, because the user's latency beats a background measurement.
+
+This replaces the old "run a probe script when you remember to" flow. An external probe file is still accepted (and `/speed-probe --external` refreshes it) for legacy cron setups, but it is now the *fallback* ranking source.
 
 **Slow-streak failover.** If the current model is slow — TTFT over the threshold, TPOT over the threshold, or a turn whose wall clock exceeded `turnWallMs` (bucketed by prompt size) — for `window` of the last turns, the extension switches to the fastest **other model of the same provider**. It never crosses providers, because that changes pricing and capabilities behind your back.
 
@@ -51,8 +62,9 @@ Restart Pi (or `/reload`).
 
 | Command | Effect |
 | --- | --- |
-| `/speed` | Rank same-provider candidates by measured TTFT; runs the configured probe first if one is set |
-| `/speed-stats` | This session's TTFT/TPOT medians per model |
+| `/speed` | Rolling window of recent TTFT / tokens-per-second per model, plus the ranked candidates; refreshes stale models in the background |
+| `/speed-probe` | Sample the stale pool models now (background); `/speed-probe --force` ignores freshness; `/speed-probe <model…>` samples exactly those; `--external` runs the legacy probe script |
+| `/speed-stats` | This session's TTFT/TPOT medians plus the rolling recent window |
 | `/speed-auto on\|off` | Toggle failover for this session |
 
 ## Configuration
@@ -87,6 +99,20 @@ Optional file `~/.pi/agent/model-speed.json`:
     "enabled": true,
     "headroomTokens": 32000
   },
+  "sampling": {
+    "enabled": true,
+    "intervalMs": 1800000,
+    "idleMs": 60000,
+    "startDelayMs": 15000,
+    "timeoutMs": 45000,
+    "promptTokens": 2000,
+    "maxTokens": 128,
+    "maxModels": 4,
+    "gapMs": 400,
+    "providers": [],
+    "models": []
+  },
+  "stats": { "windowMs": 21600000 },
   "probe": {
     "command": ["bash", "/home/me/bin/model-probe.sh"],
     "file": "/home/me/.cache/model-probe.json"
@@ -118,16 +144,28 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `sessionBinding.minImprovementMs` | `5000` | …and at least this many ms faster |
 | `contextGuard.enabled` | `true` | Skip targets whose context window cannot hold the session (`PI_MODEL_SPEED_CONTEXT_GUARD=0` turns it off) |
 | `contextGuard.headroomTokens` | `32000` | Room kept after the current prompt: the next reply plus a few turns before the window is re-checked |
-| `probe.command` | — | Optional external probe, run by `/speed` and never automatically |
+| `sampling.enabled` | `true` | Take synthetic timed samples of the whole pool in the background (`PI_MODEL_SPEED_SAMPLING=0` disables) |
+| `sampling.intervalMs` | `1800000` | A model is re-sampled at most once per this interval (`PI_MODEL_SPEED_SAMPLING_INTERVAL_MS`) |
+| `sampling.idleMs` | `60000` | Only sample after this much quiet: a sample taken mid-turn measures queueing |
+| `sampling.startDelayMs` | `15000` | Wait after session start before the first sample |
+| `sampling.timeoutMs` | `45000` | Hard cap per sample |
+| `sampling.promptTokens` | `2000` | Approximate prompt size of a synthetic sample |
+| `sampling.maxTokens` | `128` | Output tokens to ask for; enough for a stable tokens/s reading |
+| `sampling.maxModels` | `4` | Models per run (cost control); the stalest are sampled first |
+| `sampling.gapMs` | `400` | Pause between samples, so one gateway is not probed concurrently |
+| `sampling.providers` | `[]` | Providers to sample; empty = `providers`, then the current session's provider |
+| `sampling.models` | `[]` | Model ids or `provider/id` to sample; empty = every model of those providers |
+| `stats.windowMs` | `21600000` | Rolling window used by `/speed`, ranking and `stats.json` (6 h) (`PI_MODEL_SPEED_STATS_WINDOW_MS`) |
+| `probe.command` | — | Legacy external probe, only run by `/speed-probe --external` |
 | `probe.file` | — | That probe's output: `{ "ts": 1700000000, "models": { "<id>": { "ok": true, "ttft": 1.2 } } }` (`ttft` in seconds) |
 
-Environment overrides: `PI_MODEL_SPEED=0` (disable), `PI_MODEL_SPEED_DIR` (state dir), `PI_MODEL_SPEED_CONFIG` (config path), `PI_MODEL_SPEED_SLOW_MS`, `PI_MODEL_SPEED_SLOW_LARGE_MS`, `PI_MODEL_SPEED_SLOW_TPOT_MS`, `PI_MODEL_SPEED_SLOW_WALL_MS`, `PI_MODEL_SPEED_STALL_MS`, `PI_MODEL_SPEED_STREAK_MAX_AGE_MS`, `PI_MODEL_SPEED_WINDOW`, `PI_MODEL_SPEED_CONTEXT_GUARD=0`.
+Environment overrides: `PI_MODEL_SPEED=0` (disable), `PI_MODEL_SPEED_SAMPLING=0` (disable only pool sampling), `PI_MODEL_SPEED_DIR` (state dir), `PI_MODEL_SPEED_CONFIG` (config path), `PI_MODEL_SPEED_SLOW_MS`, `PI_MODEL_SPEED_SLOW_LARGE_MS`, `PI_MODEL_SPEED_SLOW_TPOT_MS`, `PI_MODEL_SPEED_SLOW_WALL_MS`, `PI_MODEL_SPEED_STALL_MS`, `PI_MODEL_SPEED_STREAK_MAX_AGE_MS`, `PI_MODEL_SPEED_WINDOW`, `PI_MODEL_SPEED_CONTEXT_GUARD=0`, `PI_MODEL_SPEED_SAMPLING_INTERVAL_MS`, `PI_MODEL_SPEED_STATS_WINDOW_MS`.
 
 ## Choosing a ranking source
 
-Ranking uses, in order: the probe file (an out-of-band measurement, e.g. a cron job), then this extension's own sample history (median TTFT per model from `speed-log.jsonl`), then "unknown". Unknown models are never picked as a switch target — the extension says "no faster same-provider model is known yet" and leaves you where you are.
+Ranking uses, in order: the rolling window (median TTFT from real turns plus synthetic samples inside `stats.windowMs`), then an external probe file for models the window has never seen, then "unknown". Unknown models are never picked as a switch target — the extension says "no faster same-provider model is known yet" and leaves you where you are.
 
-The probe is deliberately *not* part of the package: timing a model means spending tokens at *your* provider, and every gateway has its own way to do that. If you have one, point `probe.command` at it.
+Recent measured data deliberately outranks an external probe file: a probe with a cold 2 k prompt can report 0.3 s while the same model serves this session in 6 s, and the rolling window is what users actually felt. Token speed travels with the ranking, so a model that answers quickly but generates at 9 tok/s is visibly unappealing in `/speed`.
 
 ## Diagnosing "why didn't it switch?"
 
@@ -135,17 +173,22 @@ The probe is deliberately *not* part of the package: timing a model means spendi
 
 | `kind` | Meaning |
 | --- | --- |
-| `sample` | One timed request (TTFT/TPOT, prompt tokens, `longCall` for hangs) |
+| `sample` | One timed real request (TTFT/TPOT, prompt/output tokens, `longCall` for hangs) |
+| `probe` | One timed synthetic pool sample (TTFT, TPOT, tokens/s, `tokensOut`, `error`/`status` on failure) |
 | `stall` | A request produced no first token for `stallMs` (`attempt` 1 = notify+switch, 2 = abort) |
 | `switch` | The switch that happened (`from`/`to`, `reason` = `slow` or `stall`) |
 | `switch-skip` | Why it did **not** happen: `auto off`, `switch budget spent`, `switch cooldown`, `provider … not in allowlist`, `fabric child` / `subagent child`, `target … missing from registry`, `setModel(…) refused`, or `no clearly faster same-provider target` — the last one also logs the ranking it saw (`ranked`, `excluded`, `needTokens`, `currentMedian`) |
 
+`sampler-state.json` carries the lease (`lastRunAt`) and the last run summary; `stats.json` is the rolling window at the last write. `/speed` shows medians; `/speed-stats` adds the session.
+
 ```bash
-node --test packages/model-speed/tests/   # failover decision, replayed from real samples
+node --test packages/model-speed/tests/*.test.mjs   # failover decision + rolling-window math
 ```
 
 ## Notes and limits
 
-- TTFT depends on prompt size, gateway load and caching; the history median is a heuristic, not a benchmark.
-- If your provider names the deployment that answered in a header (`x-litellm-model-name` / `x-litellm-model-id`), the sample records it as `served`, which is often more useful than the requested id.
+- TTFT depends on prompt size, gateway load and caching; the window median is a heuristic, not a benchmark.
+- Synthetic samples cost tokens: ~2 k prompt + up to 128 output per model per interval, capped by `sampling.maxModels`. Set `sampling.enabled: false` (or `PI_MODEL_SPEED_SAMPLING=0`) to keep only real-turn measurements.
+- If you used an external cron/systemd probe for freshness, disable it: the extension now samples while Pi is open, and the probe file only remains as a fallback source.
+- If your provider names the deployment that answered in a header (`x-litellm-model-name` / `x-litellm-model-id`), real samples record it as `served`, which is often more useful than the requested id.
 - The extension never edits model configuration; it only calls `setModel` on the live session.

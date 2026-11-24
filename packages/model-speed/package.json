@@ -1,7 +1,7 @@
 {
   "name": "pi-model-speed",
-  "version": "0.3.2",
-  "description": "Measure real TTFT/TPOT in Pi, and automatically step off a model that is consistently slow within the same provider.",
+  "version": "0.4.0",
+  "description": "Measure real TTFT/TPOT and token throughput in Pi, sample the whole provider pool automatically, and step off a model that is consistently slow.",
   "type": "module",
   "license": "MIT",
   "author": "Qianhui Xu",

@@ -5,8 +5,18 @@
  *
  * 1. **Sampling.** Every model request is timed from `before_provider_request` to the
  *    first content delta (TTFT) and to `message_end` (TPOT = ms per output token).
- *    Samples are kept in memory for the session and appended to
- *    `~/.cache/pi-model-speed/speed-log.jsonl` so later sessions can rank by history.
+ *    Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl`, and the tail of
+ *    that log is aggregated into a rolling per-model window (`stats.ts`): median TTFT
+ *    (small and large prompts) and median/mean token generation speed (tokens/s).
+ *
+ *    Real turns only measure the model in use, so the extension also **samples the pool
+ *    itself**: when the session has been idle and a model's newest synthetic sample is
+ *    older than `sampling.intervalMs`, it sends one small timed request through
+ *    `ctx.modelRegistry.streamSimple()` (same credentials, no probe script) and records
+ *    TTFT + tokens/s as a `kind:"probe"` line. A lease file (`sampler-state.json`) and
+ *    the idle check keep several open sessions from double-sampling, and a real turn
+ *    aborts in-flight samples so user latency always wins. The rolling window is written
+ *    to `stats.json`; `/speed` shows it, `/speed-probe` refreshes it on demand.
  *
  * 2. **Slow-streak failover.** When the current model is clearly slow for `window`
  *    consecutive turns, switch to the fastest *other model of the same provider*
@@ -21,8 +31,9 @@
  *    (`minImprovementRatio` / `minImprovementMs`). A warm session only steps off a
  *    model that is genuinely broken, not one that is 20% slower.
  *
- * Ranking sources, in order: an optional external probe file (e.g. a cron job that
- * times each model), then this extension's own sample history, then registry order.
+ * Ranking sources, in order: the rolling window (recent measured TTFT/TPOT, real turns
+ * plus synthetic samples), then an optional external probe file (e.g. a legacy cron
+ * job), then registry order.
  *
  * **A hung request is not a slow turn.** `turn_end` never fires while a request is
  * stuck, so a gateway that accepts the call and then streams nothing used to hang the
@@ -64,11 +75,18 @@
  *     "minImprovementMs": 5000     // ... and at least this many ms faster
  *   },
  *   "contextGuard": { "enabled": true, "headroomTokens": 32000 },
+ *   "sampling": {
+ *     "enabled": true, "intervalMs": 1800000, "idleMs": 60000, "startDelayMs": 15000,
+ *     "timeoutMs": 45000, "promptTokens": 2000, "maxTokens": 128,
+ *     "maxModels": 4, "gapMs": 400, "providers": [], "models": []
+ *   },
+ *   "stats": { "windowMs": 21600000 },
  *   "probe": { "command": ["bash", "/path/probe.sh"], "file": "/path/last-probe.json" }
  * }
  *
- * Environment: PI_MODEL_SPEED=0 disables everything; PI_MODEL_SPEED_DIR changes the
- * state directory; PI_MODEL_SPEED_CONFIG changes the config path.
+ * Environment: PI_MODEL_SPEED=0 disables everything; PI_MODEL_SPEED_SAMPLING=0 disables
+ * only the synthetic pool sampling; PI_MODEL_SPEED_DIR changes the state directory;
+ * PI_MODEL_SPEED_CONFIG changes the config path.
  */
 import { spawn } from "node:child_process";
 import { appendFile, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -76,6 +94,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { sampleModels, type ProbeOutcome, type SamplerModel, type StreamRegistry } from "./sampler.ts";
+import { aggregate, definedMedian, median, recentRecords, sortedStats, type ModelStat } from "./stats.ts";
 
 /**
  * A child session is launched on the model its parent named, and the parent treats any
@@ -114,8 +134,12 @@ const STATE_DIR = process.env.PI_MODEL_SPEED_DIR?.trim() || join(homedir(), ".ca
 const LOG = join(STATE_DIR, "speed-log.jsonl");
 /** Keep the sample log small: it is appended to forever and only the tail is read. */
 const LOG_MAX_BYTES = 4 * 1024 * 1024;
-const LOG_TAIL_BYTES = 512 * 1024;
+const LOG_TAIL_BYTES = 1024 * 1024;
 const SWITCH_STATE = join(STATE_DIR, "switch-state.json");
+/** Lease + last-run summary, so two open sessions do not sample the pool twice. */
+const SAMPLER_STATE = join(STATE_DIR, "sampler-state.json");
+/** Snapshot of the rolling window, for scripts and for `/speed` after a fresh run. */
+const STATS_SNAPSHOT = join(STATE_DIR, "stats.json");
 
 type Thresholds = { ttftSmallMs: number; ttftLargeMs: number; largePromptTokens: number; tpotMs: number; turnWallMs: number; stallMs: number };
 type SessionBinding = {
@@ -127,6 +151,29 @@ type SessionBinding = {
 	minImprovementMs: number;
 };
 type ContextGuard = { enabled: boolean; headroomTokens: number };
+/**
+ * Automatic background sampling: every model of the chosen providers gets a synthetic
+ * timed request now and then, so "how fast is the pool" does not depend on the user
+ * remembering to run a probe, nor on the only measured model being the one in use.
+ */
+type Sampling = {
+	enabled: boolean;
+	/** A model is re-sampled at most once per interval. */
+	intervalMs: number;
+	/** Only sample when no provider request has run for this long. */
+	idleMs: number;
+	/** Wait after session start before the first sample, so startup is not slowed. */
+	startDelayMs: number;
+	timeoutMs: number;
+	promptTokens: number;
+	maxTokens: number;
+	/** Cap on models per run (cost control): the stalest ones are sampled first. */
+	maxModels: number;
+	gapMs: number;
+	providers: string[];
+	models: string[];
+};
+type StatsConfig = { windowMs: number };
 type Config = {
 	auto: boolean;
 	providers: string[];
@@ -141,6 +188,8 @@ type Config = {
 	sessionBinding: SessionBinding;
 	contextGuard: ContextGuard;
 	probe: { command?: string[]; file?: string };
+	sampling: Sampling;
+	stats: StatsConfig;
 };
 
 const num = (value: unknown, fallback: number) => {
@@ -169,6 +218,20 @@ const DEFAULT_CONFIG: Config = {
 	},
 	contextGuard: { enabled: true, headroomTokens: 32_000 },
 	probe: {},
+	sampling: {
+		enabled: process.env.PI_MODEL_SPEED_SAMPLING !== "0",
+		intervalMs: 1_800_000,
+		idleMs: 60_000,
+		startDelayMs: 15_000,
+		timeoutMs: 45_000,
+		promptTokens: 2_000,
+		maxTokens: 128,
+		maxModels: 4,
+		gapMs: 400,
+		providers: [],
+		models: [],
+	},
+	stats: { windowMs: 21_600_000 },
 };
 
 type Sample = {
@@ -178,6 +241,8 @@ type Sample = {
 	promptTokens?: number;
 	ttftMs?: number;
 	tpotMs?: number;
+	/** Output tokens reported by the provider; lets the window compute pooled tokens/s. */
+	tokensOut?: number;
 	startedAt: number;
 	endedAt?: number;
 	error?: string;
@@ -220,6 +285,16 @@ let switchedDuringStall = false;
 let liveCtx: ExtensionContext | undefined;
 let liveApi: ExtensionAPI | undefined;
 let disposed = false;
+/** Aggregated rolling window; invalidated whenever a sample is appended. */
+let statsCache: { at: number; windowMs: number; map: Map<string, ModelStat> } | undefined;
+let sessionCtx: ExtensionContext | undefined;
+let samplerTimer: ReturnType<typeof setInterval> | undefined;
+let samplerStartTimer: ReturnType<typeof setTimeout> | undefined;
+let sampling = false;
+/** In-flight synthetic samples; a real turn preempts them (same gateway, one queue). */
+let samplerAbort: AbortController | undefined;
+/** Last time a provider request started or finished; sampling waits for quiet. */
+let lastActivityAt = 0;
 
 async function loadConfig(): Promise<Config> {
 	let raw: Record<string, any> = {};
@@ -270,6 +345,25 @@ async function loadConfig(): Promise<Config> {
 			command: Array.isArray(raw.probe?.command) && raw.probe.command.length ? raw.probe.command.map(String) : undefined,
 			file: typeof raw.probe?.file === "string" ? raw.probe.file : undefined,
 		},
+		sampling: {
+			// Sampling stays on in pinned children (their measurements are still real); only a
+			// global PI_MODEL_SPEED=0 or an explicit false disables it.
+			enabled: process.env.PI_MODEL_SPEED !== "0" && raw.sampling?.enabled !== false,
+			intervalMs: num(
+				process.env.PI_MODEL_SPEED_SAMPLING_INTERVAL_MS,
+				num(raw.sampling?.intervalMs, DEFAULT_CONFIG.sampling.intervalMs),
+			),
+			idleMs: Math.max(0, num(raw.sampling?.idleMs, DEFAULT_CONFIG.sampling.idleMs)),
+			startDelayMs: Math.max(0, num(raw.sampling?.startDelayMs, DEFAULT_CONFIG.sampling.startDelayMs)),
+			timeoutMs: num(raw.sampling?.timeoutMs, DEFAULT_CONFIG.sampling.timeoutMs),
+			promptTokens: num(raw.sampling?.promptTokens, DEFAULT_CONFIG.sampling.promptTokens),
+			maxTokens: num(raw.sampling?.maxTokens, DEFAULT_CONFIG.sampling.maxTokens),
+			maxModels: Math.max(1, Math.floor(num(raw.sampling?.maxModels, DEFAULT_CONFIG.sampling.maxModels))),
+			gapMs: Math.max(0, num(raw.sampling?.gapMs, DEFAULT_CONFIG.sampling.gapMs)),
+			providers: Array.isArray(raw.sampling?.providers) ? raw.sampling.providers.filter((v: unknown) => typeof v === "string") : [],
+			models: Array.isArray(raw.sampling?.models) ? raw.sampling.models.filter((v: unknown) => typeof v === "string") : [],
+		},
+		stats: { windowMs: num(process.env.PI_MODEL_SPEED_STATS_WINDOW_MS, num(raw.stats?.windowMs, DEFAULT_CONFIG.stats.windowMs)) },
 	};
 }
 
@@ -307,6 +401,8 @@ async function appendLog(entry: Record<string, unknown>) {
 	try {
 		await mkdir(STATE_DIR, { recursive: true });
 		await appendFile(LOG, `${JSON.stringify({ ts: Date.now(), ...entry })}\n`);
+		// A measured sample changes the rolling window, so the cached aggregate is stale.
+		if (entry.kind === "sample" || entry.kind === "probe") statsCache = undefined;
 		// A log that only grows would make every history read slower forever. One
 		// rotation is enough: ranking only looks at the newest few hundred samples.
 		const size = (await stat(LOG)).size;
@@ -335,48 +431,64 @@ async function readTail(file: string): Promise<string> {
 	}
 }
 
-/** Median TTFT per model from this extension's own history (last 500 samples). */
-async function historyTtft(): Promise<Map<string, number>> {
-	const out = new Map<string, number>();
+/** Rolling-window stats: both real turns and synthetic samples, one cache for all readers. */
+async function recentStats(force = false): Promise<Map<string, ModelStat>> {
+	const windowMs = config.stats.windowMs;
+	const now = Date.now();
+	if (!force && statsCache && statsCache.windowMs === windowMs && now - statsCache.at < 30_000) return statsCache.map;
 	try {
-		const lines = (await readTail(LOG)).split("\n").filter(Boolean).slice(-500);
-		const byModel = new Map<string, number[]>();
-		for (const line of lines) {
-			let entry: any;
-			try {
-				entry = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (entry?.kind !== "sample" || entry.error || typeof entry.ttftMs !== "number") continue;
-			const key = `${entry.provider ?? "?"}/${entry.model ?? "?"}`;
-			const list = byModel.get(key) ?? [];
-			list.push(entry.ttftMs);
-			byModel.set(key, list);
-		}
-		for (const [key, list] of byModel) out.set(key, median(list));
+		const lines = (await readTail(LOG)).split("\n");
+		const records = recentRecords(lines, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens });
+		const map = aggregate(records, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens });
+		statsCache = { at: now, windowMs, map };
+		return map;
 	} catch {
-		/* no history yet */
+		return new Map<string, ModelStat>();
 	}
-	return out;
 }
 
-const median = (values: number[]): number => {
-	const sorted = [...values].sort((a, b) => a - b);
-	const mid = Math.floor(sorted.length / 2);
-	return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-};
+/** Which TTFT describes this session: the large-prompt median once the prompt is large. */
+function statTtft(stat: ModelStat, needTokens: number): number | undefined {
+	return needTokens > config.thresholds.largePromptTokens ? (stat.ttftLargeMs ?? stat.ttftMs) : (stat.ttftMs ?? stat.ttftLargeMs);
+}
 
-/** Median over the values that exist; undefined when the samples carried no TTFT at all. */
-const definedMedian = (values: Array<number | undefined>): number | undefined => {
-	const list = values.filter((v): v is number => typeof v === "number");
-	return list.length ? median(list) : undefined;
-};
+/** Compact one-line view of a model inside the rolling window. */
+function fmtStat(stat: ModelStat): string {
+	const parts = [`TTFT ${fmtMs(stat.ttftMs ?? stat.ttftLargeMs)}`];
+	if (stat.ttftLargeMs !== undefined && stat.ttftMs !== undefined) parts.push(`large ${fmtMs(stat.ttftLargeMs)}`);
+	if (stat.tokensPerSec !== undefined) parts.push(`${Math.round(stat.tokensPerSec)} tok/s`);
+	parts.push(`n=${stat.n}${stat.probeN ? ` (${stat.probeN} probe)` : ""}`);
+	if (stat.errors) parts.push(`err=${stat.errors}`);
+	parts.push(fmtAge(stat.lastProbeAt ?? stat.lastAt));
+	return parts.join(" · ");
+}
+
+function fmtAge(at: number | undefined): string {
+	if (!at) return "never";
+	const age = Math.max(0, Date.now() - at);
+	if (age < 60_000) return "just now";
+	if (age < 3_600_000) return `${Math.round(age / 60_000)}m ago`;
+	return `${(age / 3_600_000).toFixed(1)}h ago`;
+}
+
+async function writeStatsSnapshot(map: Map<string, ModelStat>) {
+	try {
+		await mkdir(STATE_DIR, { recursive: true });
+		const payload = {
+			ts: Date.now(),
+			windowMs: config.stats.windowMs,
+			models: Object.fromEntries([...map.values()].map((stat) => [stat.key, stat])),
+		};
+		await writeFile(STATS_SNAPSHOT, JSON.stringify(payload, null, 1));
+	} catch {
+		/* snapshot is a convenience, never a dependency */
+	}
+}
 
 const fmtMs = (ms?: number | null) =>
 	ms === undefined || ms === null ? "—" : !Number.isFinite(ms) ? "failed" : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 
-type Candidate = { id: string; ttftMs?: number; source: "probe" | "history" | "none"; contextWindow?: number };
+type Candidate = { id: string; ttftMs?: number; tokensPerSec?: number; source: "probe" | "history" | "none"; contextWindow?: number };
 /** A candidate that is fast enough but cannot hold the session's context. */
 type ExcludedCandidate = { id: string; contextWindow: number };
 type Ranking = { candidates: Candidate[]; excluded: ExcludedCandidate[]; needTokens: number };
@@ -426,7 +538,7 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 	const provider = ctx.model?.provider;
 	if (!provider) return { candidates: [], excluded: [], needTokens: 0 };
 	const probe = await readProbe();
-	const history = await historyTtft();
+	const stats = await recentStats();
 	const allowed = (id: string) =>
 		config.candidates.length === 0 || config.candidates.includes(id) || config.candidates.includes(`${provider}/${id}`);
 	const needTokens = contextNeed(ctx);
@@ -441,13 +553,25 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 			excluded.push({ id: model.id, contextWindow });
 			continue;
 		}
+		const stat = stats.get(`${provider}/${model.id}`);
 		const entry = probe?.models[model.id];
-		if (probe && entry?.ok === false) candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow });
-		else if (entry && pickProbeTtft(entry, needTokens) !== undefined) candidates.push({ id: model.id, ttftMs: pickProbeTtft(entry, needTokens)! * 1000, source: "probe", contextWindow });
-		else {
-			const hist = history.get(`${provider}/${model.id}`);
-			if (typeof hist === "number") candidates.push({ id: model.id, ttftMs: hist, source: "history", contextWindow });
-			else candidates.push({ id: model.id, source: "none", contextWindow });
+		// Recent measured data wins over an out-of-band probe file: the rolling window is
+		// what this session and its neighbours actually experienced, including token speed.
+		const hist = stat ? statTtft(stat, needTokens) : undefined;
+		if (typeof hist === "number") {
+			candidates.push({ id: model.id, ttftMs: hist, tokensPerSec: stat?.tokensPerSec, source: "history", contextWindow });
+		} else if (probe && entry?.ok === false) {
+			candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow });
+		} else if (entry && pickProbeTtft(entry, needTokens) !== undefined) {
+			candidates.push({
+				id: model.id,
+				ttftMs: pickProbeTtft(entry, needTokens)! * 1000,
+				tokensPerSec: typeof (entry as { tokensPerSec?: number }).tokensPerSec === "number" ? (entry as { tokensPerSec: number }).tokensPerSec : undefined,
+				source: "probe",
+				contextWindow,
+			});
+		} else {
+			candidates.push({ id: model.id, source: "none", contextWindow, tokensPerSec: stat?.tokensPerSec });
 		}
 	}
 	candidates.sort((a, b) => (a.ttftMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? Number.POSITIVE_INFINITY));
@@ -690,6 +814,146 @@ async function onStall(): Promise<void> {
 	}
 }
 
+/** Lease + last-run summary shared by every open session. */
+type SamplerState = { lastRunAt?: number; lastRun?: { at: number; models: number; ok: number; by?: string } };
+
+async function readSamplerState(): Promise<SamplerState> {
+	try {
+		return JSON.parse(await readFile(SAMPLER_STATE, "utf8")) as SamplerState;
+	} catch {
+		return {};
+	}
+}
+
+async function patchSamplerState(patch: SamplerState) {
+	try {
+		await mkdir(STATE_DIR, { recursive: true });
+		const current = await readSamplerState();
+		await writeFile(SAMPLER_STATE, JSON.stringify({ ...current, ...patch }));
+	} catch {
+		/* coordination only */
+	}
+}
+
+/** Providers whose pool should be sampled: explicit lists first, else the session's provider. */
+function samplingProviders(ctx: ExtensionContext): string[] {
+	const configured = config.sampling.providers.length ? config.sampling.providers : config.providers;
+	if (configured.length) return configured;
+	return ctx.model?.provider ? [ctx.model.provider] : [];
+}
+
+/** Models whose newest synthetic sample is older than `sampling.intervalMs`, stalest first. */
+async function staleSamplerTargets(ctx: ExtensionContext): Promise<SamplerModel[]> {
+	const providers = new Set(samplingProviders(ctx));
+	if (providers.size === 0) return [];
+	const stats = await recentStats();
+	const now = Date.now();
+	const matches = (model: { id: string; provider: string }) =>
+		config.sampling.models.length === 0 ||
+		config.sampling.models.includes(model.id) ||
+		config.sampling.models.includes(`${model.provider}/${model.id}`);
+	return ctx.modelRegistry
+		.getAvailable()
+		.filter((model) => providers.has(model.provider) && matches(model))
+		// A model that cannot hold the sample prompt would only record a context error.
+		.filter((model) => !model.contextWindow || model.contextWindow >= config.sampling.promptTokens + 2048)
+		.map((model) => ({ model, lastAt: stats.get(`${model.provider}/${model.id}`)?.lastProbeAt }))
+		.filter((entry) => !entry.lastAt || now - entry.lastAt >= config.sampling.intervalMs)
+		.sort((a, b) => (a.lastAt ?? 0) - (b.lastAt ?? 0))
+		.slice(0, config.sampling.maxModels)
+		// Keep the registry object itself: `streamSimple()` needs the full model definition.
+		.map(({ model }) => model as unknown as SamplerModel);
+}
+
+/**
+ * Take one synthetic sample per stale model and append the results to the shared log.
+ *
+ * Skipped when the session is mid-request (`idleMs`) or when another session already
+ * sampled recently (`sampler-state.json` lease): a second open Pi must not double the
+ * spend, and a sample taken while a turn is streaming would measure queueing, not the
+ * model.
+ */
+async function maybeSample(
+	ctx: ExtensionContext,
+	options: { force?: boolean; notify?: boolean; why?: string } = {},
+): Promise<ProbeOutcome[]> {
+	if (disposed || !config.sampling.enabled || sampling) return [];
+	if (!options.force) {
+		if (Date.now() - lastActivityAt < config.sampling.idleMs) return [];
+		const state = await readSamplerState();
+		if (state.lastRunAt && Date.now() - state.lastRunAt < config.sampling.intervalMs) return [];
+	}
+	const targets = await staleSamplerTargets(ctx);
+	if (targets.length === 0) return [];
+	sampling = true;
+	const at = Date.now();
+	const controller = new AbortController();
+	samplerAbort = controller;
+	try {
+		await patchSamplerState({ lastRunAt: at, lastRun: { at, models: targets.length, ok: 0, by: options.why } });
+		// A sample cancelled because the user started a turn is not an error of the model:
+		// record it nowhere, and leave the next run to fill the gap.
+		const recorded: ProbeOutcome[] = [];
+		const outcomes = await sampleModels(ctx.modelRegistry as unknown as StreamRegistry, targets, {
+			promptTokens: config.sampling.promptTokens,
+			maxTokens: config.sampling.maxTokens,
+			timeoutMs: config.sampling.timeoutMs,
+			gapMs: config.sampling.gapMs,
+			signal: controller.signal,
+			onOutcome: async (outcome) => {
+				if (outcome.error === "AbortError") return;
+				recorded.push(outcome);
+				await appendLog({ pid: process.pid, ...outcome });
+			},
+		});
+		statsCache = undefined;
+		const map = await recentStats(true);
+		await writeStatsSnapshot(map);
+		const ok = recorded.filter((outcome) => outcome.ok).length;
+		// Do not burn the interval when the run was cut short (user turn or a timeout): the
+		// next tick should retry what is still stale.
+		const incomplete = controller.signal.aborted || recorded.length < targets.length;
+		await patchSamplerState({ lastRunAt: incomplete ? 0 : at, lastRun: { at, models: targets.length, ok, by: options.why } });
+		if (options.notify && recorded.length > 0) {
+			const lines = recorded.map((outcome) =>
+				outcome.ok
+					? `${outcome.model}: ${fmtMs(outcome.ttftMs)}${outcome.tokensPerSec ? ` · ${outcome.tokensPerSec} tok/s` : ""}`
+					: `${outcome.model}: failed (${outcome.status ?? outcome.error ?? "?"})`,
+			);
+			ctx.ui.notify(`[model-speed] sampled ${targets.length} model(s) in the background: ${lines.join(" | ")}`, "info");
+		}
+		return outcomes;
+	} catch {
+		return [];
+	} finally {
+		sampling = false;
+		samplerAbort = undefined;
+	}
+}
+
+function stopSampler() {
+	if (samplerTimer !== undefined) clearInterval(samplerTimer);
+	if (samplerStartTimer !== undefined) clearTimeout(samplerStartTimer);
+	samplerTimer = undefined;
+	samplerStartTimer = undefined;
+}
+
+/** Start the background cadence; the actual run only happens when the session is idle. */
+function startSampler(ctx: ExtensionContext) {
+	stopSampler();
+	sessionCtx = ctx;
+	if (!config.sampling.enabled) return;
+	const tick = () => {
+		if (!sessionCtx) return;
+		void maybeSample(sessionCtx, { why: "auto" }).catch(() => undefined);
+	};
+	samplerStartTimer = setTimeout(tick, config.sampling.startDelayMs);
+	(samplerStartTimer as { unref?: () => void }).unref?.();
+	// Check often enough to notice staleness, but never more often than once a minute.
+	samplerTimer = setInterval(tick, Math.max(60_000, Math.min(config.sampling.intervalMs, 300_000)));
+	(samplerTimer as { unref?: () => void }).unref?.();
+}
+
 function probeSupported(): boolean {
 	return Array.isArray(config.probe.command) && config.probe.command.length > 0;
 }
@@ -721,6 +985,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	// which would make TTFT look like ~0. A queue, not a single variable, because
 	// retries and nested calls overlap.
 	pi.on("before_provider_request", async (_event, ctx) => {
+		lastActivityAt = Date.now();
+		// A real turn beats a synthetic sample: the gateway is one queue and the user is waiting.
+		samplerAbort?.abort();
 		pending.push({ model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", startedAt: Date.now() });
 		if (pending.length > 8) pending.shift();
 		// Arm the stall watchdog: if no token arrives, `turn_end` never fires and nothing else
@@ -763,6 +1030,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const sample = pending.shift();
 		if (!sample) return;
 		sample.endedAt = Date.now();
+		lastActivityAt = sample.endedAt;
 		const elapsed = sample.endedAt - sample.startedAt;
 		if (sample.ttftMs !== undefined && (sample.ttftMs < 50 || sample.ttftMs > elapsed)) delete sample.ttftMs;
 		// A hung call is still a slow call. Mark it instead of dropping it, so the streak
@@ -777,6 +1045,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 					? usage.totalTokens - output
 					: (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
 			if (promptTokens > 0) sample.promptTokens = promptTokens;
+			if (output > 0) sample.tokensOut = output;
 			if (sample.ttftMs !== undefined && output > 0) {
 				sample.tpotMs = Math.round((sample.endedAt - sample.startedAt - sample.ttftMs) / output);
 			}
@@ -802,7 +1071,21 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		if (mineMedian !== undefined) {
 			const lastPrompt = mine[mine.length - 1]?.promptTokens ?? 0;
 			const limit = lastPrompt >= config.thresholds.largePromptTokens ? config.thresholds.ttftLargeMs : config.thresholds.ttftSmallMs;
-			ctx.ui.setStatus("model-speed", `⚡ ${fmtMs(mineMedian)}${mineMedian > limit ? " ⚠" : ""}`);
+			// Newer samples carry `tokensOut`; older ones only TPOT. Either way this is the
+			// generation speed the user actually experienced in this session.
+			const tps = definedMedian(
+				mine.map((s) =>
+					typeof s.tpotMs === "number" && s.tpotMs > 0
+						? 1000 / s.tpotMs
+						: typeof s.tokensOut === "number" && s.tokensOut > 0 && typeof s.ttftMs === "number"
+							? (s.tokensOut * 1000) / Math.max(1, (s.endedAt ?? s.startedAt) - s.startedAt - s.ttftMs)
+							: undefined,
+				),
+			);
+			ctx.ui.setStatus(
+				"model-speed",
+				`⚡ ${fmtMs(mineMedian)}${mineMedian > limit ? " ⚠" : ""}${tps !== undefined ? ` · ${Math.round(tps)} tok/s` : ""}`,
+			);
 		}
 		// A manual /model change means the user is driving: forget the session's switch.
 		if (switchTarget && current.id !== switchTarget) {
@@ -828,6 +1111,10 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		stallFired = 0;
 		clearStall();
 		config = await loadConfig();
+		lastActivityAt = 0;
+		// The sampler is armed for every session (parent or child): whichever session is open
+		// keeps the pool's rolling window fresh, and the lease file stops duplicates.
+		if (event.reason !== "reload") startSampler(ctx);
 		if (event.reason === "reload") return;
 
 		const ranked = await rankCandidates(ctx);
@@ -841,10 +1128,12 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				ctx.ui.setStatus("model-speed", undefined);
 			}
 		}
-		const probe = await readProbe();
 		const current = ctx.model;
-		if (probe && current) {
-			const ageMin = probe.ts ? Math.max(0, Math.round((Date.now() / 1000 - probe.ts) / 60)) : undefined;
+		if (current) {
+			const stats = await recentStats();
+			const mine = stats.get(`${current.provider}/${current.id}`);
+			const probe = await readProbe();
+			const ageMin = probe?.ts ? Math.max(0, Math.round((Date.now() / 1000 - probe.ts) / 60)) : undefined;
 			// The probe measures every model the gateway serves; only the ones this session can
 			// actually select are worth a warning.
 			const selectable = new Set(
@@ -853,16 +1142,27 @@ export default function modelSpeed(pi: ExtensionAPI) {
 					.filter((model) => model.provider === current.provider)
 					.map((model) => model.id),
 			);
-			const slow = Object.entries(probe.models)
-				.filter(([id]) => selectable.has(id))
+			// Prefer the rolling window for the warning: a stale external probe can name a model
+			// "failed" minutes after the window saw it answer fine.
+			const slowStats = [...stats.values()]
+				.filter((stat) => stat.provider === current.provider && selectable.has(stat.model) && (stat.ttftMs ?? 0) > config.thresholds.ttftSmallMs)
+				.map((stat) => `${stat.model}=${fmtMs(stat.ttftMs)}${stat.errors ? ` (${stat.errors} err)` : ""}`);
+			const covered = new Set([...stats.values()].filter((stat) => stat.provider === current.provider).map((stat) => stat.model));
+			const slowProbe = Object.entries(probe?.models ?? {})
+				.filter(([id]) => selectable.has(id) && !covered.has(id))
 				.filter(([, value]) => value.ok === false || (value.ttft ?? 0) * 1000 > config.thresholds.ttftSmallMs)
 				.map(([id, value]) => (value.ok === false ? `${id}=failed(${value.status ?? "?"})` : `${id}=${fmtMs((value.ttft ?? 0) * 1000)}`));
-			const mine = probe.models[current.id];
-			const mineSlow = mine && (mine.ok === false || (mine.ttft ?? 0) * 1000 > config.thresholds.ttftSmallMs);
+			const slow = [...slowStats, ...slowProbe];
+			const mineSlow = mine && ((mine.ttftMs ?? 0) > config.thresholds.ttftSmallMs || mine.errors > mine.n);
 			if (slow.length > 0) {
 				ctx.ui.notify(
 					`[model-speed] slow models${ageMin === undefined ? "" : ` (measured ${ageMin} min ago)`}: ${slow.join(", ")}` +
 						(mineSlow ? ` ⚠ current ${current.id} is one of them; /model to switch` : ""),
+					"warning",
+				);
+			} else if (mineSlow) {
+				ctx.ui.notify(
+					`[model-speed] current ${current.id}: ${fmtStat(mine)} — over the slow threshold; /speed for the pool`,
 					"warning",
 				);
 			}
@@ -875,7 +1175,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const currentId = ctx.model?.id;
 		const lines = ranking.candidates.map(
 			(candidate) =>
-				`${candidate.id === currentId ? "*" : " "} ${candidate.id}: ${fmtMs(candidate.ttftMs)}${candidate.source === "none" ? "" : ` (${candidate.source})`}`,
+				`${candidate.id === currentId ? "*" : " "} ${candidate.id}: ${fmtMs(candidate.ttftMs)}${candidate.tokensPerSec !== undefined ? ` · ${Math.round(candidate.tokensPerSec)} tok/s` : ""}${candidate.source === "none" ? "" : ` (${candidate.source})`}`,
 		);
 		for (const entry of ranking.excluded) {
 			lines.push(`  ${entry.id}: skipped, context window ${entry.contextWindow} < session ${ranking.needTokens} tokens`);
@@ -886,41 +1186,119 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		return lines;
 	};
 
+	/** Rolling window for every provider with recent data; current provider first. */
+	const renderRecent = async (ctx: ExtensionContext) => {
+		const stats = await recentStats();
+		const currentProvider = ctx.model?.provider;
+		const list = sortedStats(stats, config.thresholds.largePromptTokens).sort((a, b) => {
+			const mine = (a.provider === currentProvider ? 0 : 1) - (b.provider === currentProvider ? 0 : 1);
+			if (mine !== 0) return mine;
+			return (a.ttftMs ?? a.ttftLargeMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? b.ttftLargeMs ?? Number.POSITIVE_INFINITY);
+		});
+		const windowH = Math.round(config.stats.windowMs / 360_000) / 10;
+		const lines = list.map((stat) => `${stat.provider === currentProvider ? "*" : " "} ${stat.model}: ${fmtStat(stat)}`);
+		ctx.ui.setWidget("model-speed", [`recent ${windowH}h (fastest first):`, ...lines.map((line) => `  ${line}`)], {
+			placement: "belowEditor",
+		});
+		return lines;
+	};
+
 	pi.registerCommand("speed", {
-		description: "Show measured model speed for the current provider, and run the configured probe if any",
+		description: "Show recent measured TTFT / tokens-per-second per model (rolling window), and rank candidates",
 		handler: async (_args, ctx) => {
-			if (probeSupported()) {
-				ctx.ui.notify("[model-speed] running probe…", "info");
+			const lines = await renderRecent(ctx);
+			ctx.ui.notify(
+				lines.length ? `[model-speed] recent: ${lines.join(" | ")}` : "[model-speed] no samples in the recent window yet — /speed-probe to take some now",
+				"info",
+			);
+			const ranked = await renderRanking(ctx);
+			if (ranked.length) ctx.ui.notify(`[model-speed] candidates: ${ranked.join(" | ")}`, "info");
+			// `/speed` is now history-first: refresh in the background instead of blocking the TUI
+			// on a synchronous probe.
+			void maybeSample(ctx, { why: "speed" }).catch(() => undefined);
+		},
+	});
+
+	pi.registerCommand("speed-probe", {
+		description: "Sample the pool now (background by default): /speed-probe [--force] [model ...]",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const force = tokens.includes("--force");
+			const only = tokens.filter((token) => token !== "--force" && token !== "--external");
+			// Legacy escape hatch: some setups keep an out-of-band probe script. Refresh it on
+			// demand, but the native sampler is what keeps the window fresh otherwise.
+			if (tokens.includes("--external")) {
+				if (!probeSupported()) {
+					ctx.ui.notify("[model-speed] no probe.command configured", "warning");
+					return;
+				}
+				ctx.ui.notify("[model-speed] running external probe…", "info");
 				const output = await runProbe();
 				if (output) ctx.ui.notify(`[model-speed] probe: ${output.split("\n").slice(-3).join(" | ")}`, "info");
+				return;
 			}
-			const lines = await renderRanking(ctx);
-			ctx.ui.notify(lines.length ? `[model-speed] ${lines.join(" | ")}` : "[model-speed] no candidates for this provider", "info");
+			if (only.length > 0) {
+				// Explicit ids get a forced run of exactly those models: a one-off question
+				// should not wait for the interval.
+				const models = only
+					.map((id) => (id.includes("/") ? id.split("/") : [ctx.model?.provider ?? "", id]))
+					.map(([provider, id]) => ctx.modelRegistry.find(provider, id))
+					.filter((model): model is NonNullable<typeof model> => Boolean(model));
+				if (models.length === 0) {
+					ctx.ui.notify(`[model-speed] no such model: ${only.join(", ")}`, "warning");
+					return;
+				}
+				const outcomes = await sampleModels(ctx.modelRegistry as unknown as StreamRegistry, models, {
+					promptTokens: config.sampling.promptTokens,
+					maxTokens: config.sampling.maxTokens,
+					timeoutMs: config.sampling.timeoutMs,
+					gapMs: config.sampling.gapMs,
+					onOutcome: async (outcome) => {
+						if (outcome.error === "AbortError") return;
+						await appendLog({ pid: process.pid, ...outcome });
+					},
+				});
+				statsCache = undefined;
+				await writeStatsSnapshot(await recentStats(true));
+				const lines = outcomes.map((outcome) =>
+					outcome.ok ? `${outcome.model}: ${fmtMs(outcome.ttftMs)} · ${outcome.tokensPerSec ?? "?"} tok/s` : `${outcome.model}: failed (${outcome.error ?? outcome.status})`,
+				);
+				ctx.ui.notify(`[model-speed] ${lines.join(" | ")}`, "info");
+				return;
+			}
+			if (force) {
+				const outcomes = await maybeSample(ctx, { force: true, notify: true, why: "command" });
+				if (outcomes.length === 0) ctx.ui.notify("[model-speed] nothing to sample (disabled, busy, or every model is fresh)", "info");
+				return;
+			}
+			ctx.ui.notify("[model-speed] sampling the stale models in the background…", "info");
+			void maybeSample(ctx, { force: true, notify: true, why: "command" }).catch(() => undefined);
 		},
 	});
 
 	pi.registerCommand("speed-stats", {
-		description: "Show this session's measured TTFT/TPOT per model",
+		description: "This session's TTFT/TPOT medians plus the rolling recent window",
 		handler: async (_args, ctx) => {
-			if (samples.length === 0) {
-				ctx.ui.notify("[model-speed] no samples in this session yet", "info");
-				return;
+			const recent = await renderRecent(ctx);
+			const session: string[] = [];
+			if (samples.length > 0) {
+				const byModel = new Map<string, Sample[]>();
+				const seen = new Set<number>();
+				for (const sample of samples) {
+					if (seen.has(sample.startedAt)) continue; // two extension instances can record the same call
+					seen.add(sample.startedAt);
+					const key = sample.model || "?";
+					byModel.set(key, [...(byModel.get(key) ?? []), sample]);
+				}
+				session.push(...[...byModel].map(([model, list]) => {
+					const ttft = list.map((s) => s.ttftMs).filter((v): v is number => typeof v === "number");
+					const tps = list
+						.map((s) => (typeof s.tpotMs === "number" && s.tpotMs > 0 ? 1000 / s.tpotMs : undefined))
+						.filter((v): v is number => typeof v === "number");
+					return `${model}: n=${list.length} TTFT median=${fmtMs(ttft.length ? median(ttft) : undefined)} ${tps.length ? `${Math.round(median(tps))} tok/s` : "—"}`;
+				}));
 			}
-			const byModel = new Map<string, Sample[]>();
-			const seen = new Set<number>();
-			for (const sample of samples) {
-				if (seen.has(sample.startedAt)) continue; // two extension instances can record the same call
-				seen.add(sample.startedAt);
-				const key = sample.model || "?";
-				byModel.set(key, [...(byModel.get(key) ?? []), sample]);
-			}
-			const lines = [...byModel].map(([model, list]) => {
-				const ttft = list.map((s) => s.ttftMs).filter((v): v is number => typeof v === "number");
-				const tpot = list.map((s) => s.tpotMs).filter((v): v is number => typeof v === "number");
-				return `${model}: n=${list.length} TTFT median=${fmtMs(ttft.length ? median(ttft) : undefined)} TPOT median=${tpot.length ? `${Math.round(median(tpot))}ms` : "—"}`;
-			});
-			ctx.ui.setWidget("model-speed", ["this session:", ...lines], { placement: "belowEditor" });
-			ctx.ui.notify(`[model-speed] ${lines.join(" | ")}`, "info");
+			ctx.ui.notify(`[model-speed] ${[...recent, ...session].join(" | ") || "no samples yet"}`, "info");
 		},
 	});
 
@@ -946,6 +1324,8 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		disposed = true;
 		clearStall();
+		stopSampler();
+		sessionCtx = undefined;
 		if (samples.length) await appendLog({ kind: "session-end", samples: samples.length });
 	});
 }
