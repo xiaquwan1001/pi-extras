@@ -23,6 +23,19 @@
  *    (never across providers — that changes pricing and capabilities). Once per
  *    cooldown, at most once per session, and a manual `/model` resets everything.
  *
+ *    "Fastest" is a *verdict*, not a six-hour average: the recency cohort
+ *    (`stats.recentMs`, default = one sampling interval) decides, and a model whose newest
+ *    measurement is older than `stats.staleMs` has no verdict at all instead of a stale
+ *    "fast" one. The 6 h median diluted exactly the readings that mattered — a 10.2 s
+ *    sample against four 1.3 s samples from hours earlier still read "1.4 s, fast"
+ *    (2026-11-24, `ustc-glm`), which is how a slow pool got picked as the fast one after a
+ *    long idle gap.
+ *
+ *    The switch budget, the model this session stepped onto and the models it abandoned
+ *    are **per session and persisted** (`sessions.ts` + `switch-state.json.sessions`), so
+ *    `/reload`, `--resume` and fork remember what this conversation already did instead of
+ *    handing it a fresh budget and a legal path back to the model it just left.
+ *
  * 3. **A warm session is expensive to leave.** Switching models throws away the
  *    gateway's prefix cache and re-pays for the whole prompt, so once the session is
  *    *bound* (after `sessionBinding.warmTurns` turns or `warmAfterMs`, or as soon as a
@@ -80,13 +93,14 @@
  *     "timeoutMs": 45000, "promptTokens": 2000, "maxTokens": 128,
  *     "maxModels": 4, "gapMs": 400, "providers": [], "models": []
  *   },
- *   "stats": { "windowMs": 21600000 },
- *   "probe": { "command": ["bash", "/path/probe.sh"], "file": "/path/last-probe.json" }
+ *   "stats": { "windowMs": 21600000, "recentMs": 1800000, "staleMs": 3600000 },
+ *   "probe": { "command": ["bash", "/path/probe.sh"], "file": "/path/last-probe.json", "maxAgeMs": 3600000 }
  * }
  *
  * Environment: PI_MODEL_SPEED=0 disables everything; PI_MODEL_SPEED_SAMPLING=0 disables
  * only the synthetic pool sampling; PI_MODEL_SPEED_DIR changes the state directory;
- * PI_MODEL_SPEED_CONFIG changes the config path.
+ * PI_MODEL_SPEED_CONFIG changes the config path; PI_MODEL_SPEED_RECENT_MS /
+ * PI_MODEL_SPEED_STALE_MS adjust the verdict cohorts.
  */
 import { spawn } from "node:child_process";
 import { appendFile, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -95,7 +109,18 @@ import { join } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { sampleModels, type ProbeOutcome, type SamplerModel, type StreamRegistry } from "./sampler.ts";
-import { aggregate, definedMedian, median, recentRecords, sortedStats, type ModelStat } from "./stats.ts";
+import {
+	ephemeralSessionKey,
+	inheritedSessionKey,
+	mergeSessionMemory,
+	pruneSessions,
+	recentlyAbandoned,
+	rekeySession,
+	sessionKeyFromFile,
+	type SessionSwitchMemory,
+	type SwitchStateFile,
+} from "./sessions.ts";
+import { aggregate, definedMedian, median, recentRecords, sortedVerdicts, type ModelStat, type Verdict, verdict } from "./stats.ts";
 
 /**
  * A child session is launched on the model its parent named, and the parent treats any
@@ -173,7 +198,14 @@ type Sampling = {
 	providers: string[];
 	models: string[];
 };
-type StatsConfig = { windowMs: number };
+type StatsConfig = {
+	/** Rolling window for the per-model medians. */
+	windowMs: number;
+	/** Cohort that decides the *verdict* (what ranking and `/speed` trust); 0 = whole window. */
+	recentMs: number;
+	/** No measurement newer than this means "unknown", never "fast". */
+	staleMs: number;
+};
 type Config = {
 	auto: boolean;
 	providers: string[];
@@ -187,7 +219,7 @@ type Config = {
 	cooldownMs: number;
 	sessionBinding: SessionBinding;
 	contextGuard: ContextGuard;
-	probe: { command?: string[]; file?: string };
+	probe: { command?: string[]; file?: string; maxAgeMs: number };
 	sampling: Sampling;
 	stats: StatsConfig;
 };
@@ -231,7 +263,7 @@ const DEFAULT_CONFIG: Config = {
 		providers: [],
 		models: [],
 	},
-	stats: { windowMs: 21_600_000 },
+	stats: { windowMs: 21_600_000, recentMs: 1_800_000, staleMs: 3_600_000 },
 };
 
 type Sample = {
@@ -262,11 +294,19 @@ type ProbeEntry = {
 type ProbeFile = { ts?: number; models: Record<string, ProbeEntry> };
 
 let config: Config = DEFAULT_CONFIG;
+/**
+ * Identity of the conversation these counters belong to. The switch budget and the
+ * abandoned-model list are per conversation, and they are persisted under this key so a
+ * reload/resume/fork remembers what this session already did (see `sessions.ts`).
+ */
+let sessionKey = ephemeralSessionKey();
 let samples: Sample[] = [];
 let pending: Array<Sample> = [];
 let lastSwitchAt = 0;
 let switchCount = 0;
 let switchTarget: string | undefined;
+/** Model our own `setModel()` is about to select; a `model_select` for it is not a user action. */
+let autoSwitchTo: string | undefined;
 let lastNoTargetAt = 0;
 let sessionStartedAt = 0;
 let turnCount = 0;
@@ -286,7 +326,7 @@ let liveCtx: ExtensionContext | undefined;
 let liveApi: ExtensionAPI | undefined;
 let disposed = false;
 /** Aggregated rolling window; invalidated whenever a sample is appended. */
-let statsCache: { at: number; windowMs: number; map: Map<string, ModelStat> } | undefined;
+let statsCache: { at: number; windowMs: number; recentMs: number; map: Map<string, ModelStat> } | undefined;
 let sessionCtx: ExtensionContext | undefined;
 let samplerTimer: ReturnType<typeof setInterval> | undefined;
 let samplerStartTimer: ReturnType<typeof setTimeout> | undefined;
@@ -307,6 +347,18 @@ async function loadConfig(): Promise<Config> {
 	const envThreshold = (name: string, fallback: number) => num(process.env[name], fallback);
 	const disabled = process.env.PI_MODEL_SPEED === "0" || (PINNED_CHILD && !AUTO_IN_CHILD);
 	const window = Math.max(2, Math.floor(num(process.env.PI_MODEL_SPEED_WINDOW, num(raw.window, 3))));
+	// The verdict cohort defaults to the sampling cadence: one sampling interval is exactly
+	// the set of measurements that still describe "now"; older ones only dilute them.
+	const recentMs = (() => {
+		const fallback = num(raw.sampling?.intervalMs, DEFAULT_CONFIG.sampling.intervalMs);
+		const n = Number(process.env.PI_MODEL_SPEED_RECENT_MS ?? raw.stats?.recentMs ?? fallback);
+		return Number.isFinite(n) && n >= 0 ? n : DEFAULT_CONFIG.stats.recentMs;
+	})();
+	// Twice the cohort: a model measured once in the previous cohort is old-ish, not unknown.
+	const staleMs = (() => {
+		const n = Number(process.env.PI_MODEL_SPEED_STALE_MS ?? raw.stats?.staleMs ?? 0);
+		return Number.isFinite(n) && n > 0 ? n : Math.max(recentMs * 2, DEFAULT_CONFIG.stats.staleMs / 2);
+	})();
 	return {
 		auto: disabled ? false : (raw.auto ?? DEFAULT_CONFIG.auto) !== false,
 		providers: Array.isArray(raw.providers) ? raw.providers.filter((v: unknown) => typeof v === "string") : [],
@@ -344,6 +396,8 @@ async function loadConfig(): Promise<Config> {
 		probe: {
 			command: Array.isArray(raw.probe?.command) && raw.probe.command.length ? raw.probe.command.map(String) : undefined,
 			file: typeof raw.probe?.file === "string" ? raw.probe.file : undefined,
+			// An out-of-band probe file is a snapshot: hours later it is history, not a measurement.
+			maxAgeMs: num(process.env.PI_MODEL_SPEED_PROBE_MAX_AGE_MS, num(raw.probe?.maxAgeMs, DEFAULT_CONFIG.probe.maxAgeMs)),
 		},
 		sampling: {
 			// Sampling stays on in pinned children (their measurements are still real); only a
@@ -363,7 +417,11 @@ async function loadConfig(): Promise<Config> {
 			providers: Array.isArray(raw.sampling?.providers) ? raw.sampling.providers.filter((v: unknown) => typeof v === "string") : [],
 			models: Array.isArray(raw.sampling?.models) ? raw.sampling.models.filter((v: unknown) => typeof v === "string") : [],
 		},
-		stats: { windowMs: num(process.env.PI_MODEL_SPEED_STATS_WINDOW_MS, num(raw.stats?.windowMs, DEFAULT_CONFIG.stats.windowMs)) },
+		stats: {
+			windowMs: num(process.env.PI_MODEL_SPEED_STATS_WINDOW_MS, num(raw.stats?.windowMs, DEFAULT_CONFIG.stats.windowMs)),
+			recentMs,
+			staleMs,
+		},
 	};
 }
 
@@ -377,9 +435,7 @@ async function readProbe(): Promise<ProbeFile | null> {
 	}
 }
 
-type SwitchHistoryEntry = { from: string; to: string; at: number };
-
-async function readSwitchState(): Promise<{ lastSwitchAt?: number; history?: SwitchHistoryEntry[] }> {
+async function readSwitchState(): Promise<SwitchStateFile> {
 	try {
 		return JSON.parse(await readFile(SWITCH_STATE, "utf8"));
 	} catch {
@@ -397,10 +453,81 @@ async function writeSwitchState(patch: Record<string, unknown>) {
 	}
 }
 
+/**
+ * Write this session's counters to `switch-state.json`. Called after every change *and*
+ * on shutdown, because the in-memory copy dies with the process: a reload or `--resume`
+ * starts a fresh extension instance, and without this it would forget that this
+ * conversation already switched (and which model it left).
+ */
+async function persistSessionMemory(patch: Partial<SessionSwitchMemory> = {}) {
+	const now = Date.now();
+	try {
+		const state = await readSwitchState();
+		const next = mergeSessionMemory(
+			state,
+			sessionKey,
+			{
+				switches: switchCount,
+				target: switchTarget,
+				lastSwitchAt,
+				startedAt: sessionStartedAt || now,
+				...patch,
+			},
+			now,
+		);
+		await writeSwitchState({ ...next, sessions: pruneSessions(next.sessions ?? {}, now) });
+	} catch {
+		/* memory is best effort */
+	}
+}
+
+/**
+ * Rebuild this session's timed-sample history from the shared log.
+ *
+ * The pieces a reload/resume must not lose are exactly the ones the failover decision
+ * reads: `samples` (streak, status line, `sessionBound`) and the switch counters. Both
+ * are keyed by `session`, which every log line now carries.
+ */
+async function restoreSessionSamples(key: string): Promise<Sample[]> {
+	try {
+		const lines = (await readTail(LOG)).split("\n");
+		const out: Sample[] = [];
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let record: any;
+			try {
+				record = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (record?.kind !== "sample" || record.session !== key || !record.model || !record.provider) continue;
+			if (typeof record.startedAt !== "number") continue;
+			out.push({
+				model: record.model,
+				provider: record.provider,
+				served: record.served,
+				promptTokens: record.promptTokens,
+				ttftMs: record.ttftMs,
+				tpotMs: record.tpotMs,
+				tokensOut: record.tokensOut,
+				startedAt: record.startedAt,
+				endedAt: record.endedAt,
+				error: record.error,
+				longCall: record.longCall,
+			});
+		}
+		return out.slice(-50);
+	} catch {
+		return [];
+	}
+}
+
 async function appendLog(entry: Record<string, unknown>) {
 	try {
 		await mkdir(STATE_DIR, { recursive: true });
-		await appendFile(LOG, `${JSON.stringify({ ts: Date.now(), ...entry })}\n`);
+		// Every line carries the conversation it belongs to: that is what lets a resumed
+		// session rebuild its own history instead of starting from zero.
+		await appendFile(LOG, `${JSON.stringify({ ts: Date.now(), session: sessionKey, ...entry })}\n`);
 		// A measured sample changes the rolling window, so the cached aggregate is stale.
 		if (entry.kind === "sample" || entry.kind === "probe") statsCache = undefined;
 		// A log that only grows would make every history read slower forever. One
@@ -434,32 +561,46 @@ async function readTail(file: string): Promise<string> {
 /** Rolling-window stats: both real turns and synthetic samples, one cache for all readers. */
 async function recentStats(force = false): Promise<Map<string, ModelStat>> {
 	const windowMs = config.stats.windowMs;
+	const recentMs = config.stats.recentMs;
 	const now = Date.now();
-	if (!force && statsCache && statsCache.windowMs === windowMs && now - statsCache.at < 30_000) return statsCache.map;
+	if (!force && statsCache && statsCache.windowMs === windowMs && statsCache.recentMs === recentMs && now - statsCache.at < 30_000)
+		return statsCache.map;
 	try {
 		const lines = (await readTail(LOG)).split("\n");
 		const records = recentRecords(lines, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens });
-		const map = aggregate(records, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens });
-		statsCache = { at: now, windowMs, map };
+		const map = aggregate(records, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens, recentMs });
+		statsCache = { at: now, windowMs, recentMs, map };
 		return map;
 	} catch {
 		return new Map<string, ModelStat>();
 	}
 }
 
-/** Which TTFT describes this session: the large-prompt median once the prompt is large. */
-function statTtft(stat: ModelStat, needTokens: number): number | undefined {
-	return needTokens > config.thresholds.largePromptTokens ? (stat.ttftLargeMs ?? stat.ttftMs) : (stat.ttftMs ?? stat.ttftLargeMs);
+/**
+ * What this model is allowed to claim right now. `recent` wins over the 6 h median, and a
+ * model measured only before `stats.staleMs` has **no** TTFT at all — an old fast number
+ * masquerading as a candidate is exactly the bug this replaced (2026-11-24: glm measured
+ * 10.2 s while its window median was 1.4 s, and it ranked as the fastest model).
+ */
+function statVerdict(stat: ModelStat, needTokens: number): Verdict {
+	return verdict(stat, {
+		now: Date.now(),
+		largePromptTokens: config.thresholds.largePromptTokens,
+		needTokens,
+		staleMs: config.stats.staleMs,
+	});
 }
 
 /** Compact one-line view of a model inside the rolling window. */
 function fmtStat(stat: ModelStat): string {
-	const parts = [`TTFT ${fmtMs(stat.ttftMs ?? stat.ttftLargeMs)}`];
+	const current = statVerdict(stat, 0);
+	const parts = [`TTFT ${fmtMs(current.ttftMs ?? stat.ttftMs ?? stat.ttftLargeMs)}`];
 	if (stat.ttftLargeMs !== undefined && stat.ttftMs !== undefined) parts.push(`large ${fmtMs(stat.ttftLargeMs)}`);
-	if (stat.tokensPerSec !== undefined) parts.push(`${Math.round(stat.tokensPerSec)} tok/s`);
+	if ((current.tokensPerSec ?? stat.tokensPerSec) !== undefined) parts.push(`${Math.round((current.tokensPerSec ?? stat.tokensPerSec)!)} tok/s`);
 	parts.push(`n=${stat.n}${stat.probeN ? ` (${stat.probeN} probe)` : ""}`);
 	if (stat.errors) parts.push(`err=${stat.errors}`);
-	parts.push(fmtAge(stat.lastProbeAt ?? stat.lastAt));
+	if (current.source === "stale") parts.push(`stale ${fmtAgeSpan(current.ageMs)}`);
+	else parts.push(`${current.source === "recent" ? "" : "window "}${fmtAge(stat.lastProbeAt ?? stat.lastAt)}`);
 	return parts.join(" · ");
 }
 
@@ -470,6 +611,13 @@ function fmtAge(at: number | undefined): string {
 	if (age < 3_600_000) return `${Math.round(age / 60_000)}m ago`;
 	return `${(age / 3_600_000).toFixed(1)}h ago`;
 }
+
+const fmtAgeSpan = (ms?: number): string => {
+	if (ms === undefined || !Number.isFinite(ms)) return "never";
+	if (ms < 60_000) return "just now";
+	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+	return `${(ms / 3_600_000).toFixed(1)}h ago`;
+};
 
 async function writeStatsSnapshot(map: Map<string, ModelStat>) {
 	try {
@@ -488,7 +636,15 @@ async function writeStatsSnapshot(map: Map<string, ModelStat>) {
 const fmtMs = (ms?: number | null) =>
 	ms === undefined || ms === null ? "—" : !Number.isFinite(ms) ? "failed" : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 
-type Candidate = { id: string; ttftMs?: number; tokensPerSec?: number; source: "probe" | "history" | "none"; contextWindow?: number };
+type Candidate = {
+	id: string;
+	ttftMs?: number;
+	tokensPerSec?: number;
+	/** `recent`/`window` = measured in the rolling window, `probe` = external probe file, `stale`/`none` = not rankable. */
+	source: "recent" | "window" | "probe" | "stale" | "none";
+	contextWindow?: number;
+	ageMs?: number;
+};
 /** A candidate that is fast enough but cannot hold the session's context. */
 type ExcludedCandidate = { id: string; contextWindow: number };
 type Ranking = { candidates: Candidate[]; excluded: ExcludedCandidate[]; needTokens: number };
@@ -538,6 +694,10 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 	const provider = ctx.model?.provider;
 	if (!provider) return { candidates: [], excluded: [], needTokens: 0 };
 	const probe = await readProbe();
+	// A probe file is a snapshot. Once it is older than `probe.maxAgeMs` it is history: it
+	// must not name a model fast hours after that measurement was taken.
+	const probeAgeMs = probe?.ts ? Date.now() - probe.ts * 1000 : Number.POSITIVE_INFINITY;
+	const probeUsable = probe !== null && probeAgeMs <= config.probe.maxAgeMs;
 	const stats = await recentStats();
 	const allowed = (id: string) =>
 		config.candidates.length === 0 || config.candidates.includes(id) || config.candidates.includes(`${provider}/${id}`);
@@ -554,14 +714,21 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 			continue;
 		}
 		const stat = stats.get(`${provider}/${model.id}`);
-		const entry = probe?.models[model.id];
-		// Recent measured data wins over an out-of-band probe file: the rolling window is
-		// what this session and its neighbours actually experienced, including token speed.
-		const hist = stat ? statTtft(stat, needTokens) : undefined;
-		if (typeof hist === "number") {
-			candidates.push({ id: model.id, ttftMs: hist, tokensPerSec: stat?.tokensPerSec, source: "history", contextWindow });
-		} else if (probe && entry?.ok === false) {
-			candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow });
+		const entry = probeUsable ? probe?.models[model.id] : undefined;
+		// A fresh measurement wins over an older one: the verdict prefers the recency cohort,
+		// and it refuses to call a model fast when everything known about it is stale.
+		const current = stat ? statVerdict(stat, needTokens) : undefined;
+		if (current && typeof current.ttftMs === "number") {
+			candidates.push({
+				id: model.id,
+				ttftMs: current.ttftMs,
+				tokensPerSec: current.tokensPerSec,
+				source: current.source === "recent" ? "recent" : "window",
+				contextWindow,
+				ageMs: current.ageMs,
+			});
+		} else if (entry?.ok === false) {
+			candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow, ageMs: probeAgeMs });
 		} else if (entry && pickProbeTtft(entry, needTokens) !== undefined) {
 			candidates.push({
 				id: model.id,
@@ -569,9 +736,17 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 				tokensPerSec: typeof (entry as { tokensPerSec?: number }).tokensPerSec === "number" ? (entry as { tokensPerSec: number }).tokensPerSec : undefined,
 				source: "probe",
 				contextWindow,
+				ageMs: probeAgeMs,
 			});
 		} else {
-			candidates.push({ id: model.id, source: "none", contextWindow, tokensPerSec: stat?.tokensPerSec });
+			const stale = current?.source === "stale" || (!current && probe !== null && !probeUsable);
+			candidates.push({
+				id: model.id,
+				source: stale ? "stale" : "none",
+				contextWindow,
+				tokensPerSec: current?.tokensPerSec ?? stat?.tokensPerSec,
+				ageMs: current?.ageMs,
+			});
 		}
 	}
 	candidates.sort((a, b) => (a.ttftMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? Number.POSITIVE_INFINITY));
@@ -686,9 +861,15 @@ async function switchToFaster(
 	const currentMedian = definedMedian(streak.tail.map((s) => s.ttftMs));
 	const shared = await readSwitchState();
 	const history = Array.isArray(shared.history) ? shared.history : [];
-	// Anti ping-pong: do not jump back to a model this session just abandoned.
+	const memory = shared.sessions?.[sessionKey];
+	// Anti ping-pong, read from *this session's* memory first: what another session
+	// abandoned says nothing about this one, and using the global list here used to block
+	// a fresh session from a model it had never tried.
+	const mine = recentlyAbandoned(memory, Date.now(), config.cooldownMs);
 	const recentlyLeft = (id: string) =>
-		history.some((entry) => entry?.from === id && typeof entry.at === "number" && Date.now() - entry.at < config.cooldownMs);
+		memory
+			? mine.includes(id)
+			: history.some((entry) => entry?.from === id && typeof entry.at === "number" && Date.now() - entry.at < config.cooldownMs);
 	// A barely-faster model is not worth the prefix cache: require a clear win.
 	const clearlyFaster = (candidate: Candidate) => {
 		if (candidate.id === current.id || typeof candidate.ttftMs !== "number" || !Number.isFinite(candidate.ttftMs)) return false;
@@ -732,24 +913,42 @@ async function switchToFaster(
 	}
 	const target = ctx.modelRegistry.find(current.provider, best.id);
 	if (!target) return skip(`target ${best.id} missing from registry`);
+	// Our own switch also fires `model_select`; mark it so the handler does not read it as a
+	// manual /model (which would clear the budget we are about to spend).
+	autoSwitchTo = best.id;
 	const switched = await pi.setModel(target);
-	if (!switched) return skip(`setModel(${best.id}) refused`);
+	if (!switched) {
+		autoSwitchTo = undefined;
+		return skip(`setModel(${best.id}) refused`);
+	}
 	lastSwitchAt = Date.now();
 	const at = lastSwitchAt;
+	switchCount += 1;
+	switchTarget = best.id;
+	// Persist *this session's* memory: a reload/resume must not hand back a fresh budget
+	// and a legal target list that includes the model this conversation just left.
+	const abandoned = [...(memory?.abandoned ?? []), { from: current.id, to: best.id, at }].slice(-8);
+	const next = mergeSessionMemory(shared, sessionKey, {
+		switches: switchCount,
+		target: best.id,
+		lastSwitchAt: at,
+		startedAt: sessionStartedAt || at,
+		abandoned,
+	}, at);
 	await writeSwitchState({
+		...next,
 		lastSwitchAt: at,
 		lastFrom: current.id,
 		lastTo: best.id,
 		history: [...history, { from: current.id, to: best.id, at }].slice(-8),
+		sessions: pruneSessions(next.sessions ?? {}, at),
 	});
-	switchCount += 1;
-	switchTarget = best.id;
 	ctx.ui.notify(
 		`[model-speed] ${current.id}: ${state} → switched to ${best.id} (${fmtMs(best.ttftMs)}, via ${best.source})` +
 			(switchCount > 1 ? ` [#${switchCount}/${config.maxSwitchesPerSession}]` : ""),
 		"warning",
 	);
-	await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason, bound: streak.bound, streak: streak.tail });
+	await appendLog({ kind: "switch", pid: process.pid, from: current.id, to: best.id, reason, bound: streak.bound, switches: switchCount, streak: streak.tail });
 	return true;
 }
 
@@ -901,7 +1100,10 @@ async function maybeSample(
 			gapMs: config.sampling.gapMs,
 			signal: controller.signal,
 			onOutcome: async (outcome) => {
-				if (outcome.error === "AbortError") return;
+				// A sample the *user* preempted is not a failure of the model. `AbortError` was the
+				// only spelling checked, so pi's "Request aborted" was logged as a model error and a
+				// healthy model collected spurious `err=` counts (log, 2026-11-24 22:53:27).
+				if (controller.signal.aborted || outcome.error === "AbortError" || /abort/i.test(String(outcome.error ?? ""))) return;
 				recorded.push(outcome);
 				await appendLog({ pid: process.pid, ...outcome });
 			},
@@ -1088,21 +1290,52 @@ export default function modelSpeed(pi: ExtensionAPI) {
 			);
 		}
 		// A manual /model change means the user is driving: forget the session's switch.
+		// (`autoSwitchTo` is consumed by `model_select`; by the end of a turn it is stale
+		// either way, and leaving it set would misread a later manual pick as our own.)
+		autoSwitchTo = undefined;
 		if (switchTarget && current.id !== switchTarget) {
 			switchCount = 0;
 			switchTarget = undefined;
+			lastSwitchAt = 0;
+			void persistSessionMemory({ switches: 0, target: undefined, lastSwitchAt: 0 });
 		}
 		const streak = slowStreak();
 		if (!streak) return;
 		await switchToFaster(pi, ctx, streak, "slow");
 	});
 
+	// A model change that did not come from us is the user driving, and it also tells us
+	// whether a *resumed* session is still on the model it switched to.
+	pi.on("model_select", async (event) => {
+		const next = event.model?.id;
+		if (!next) return;
+		if (autoSwitchTo && next === autoSwitchTo) {
+			autoSwitchTo = undefined;
+			return;
+		}
+		autoSwitchTo = undefined;
+		// `restore` is pi re-selecting the session's stored model: not a user decision.
+		if (event.source === "restore") return;
+		if (switchCount === 0 && switchTarget === undefined) return; // nothing to forget
+		switchCount = 0;
+		switchTarget = undefined;
+		lastSwitchAt = 0;
+		await appendLog({ kind: "model-select", model: next, previous: event.previousModel?.id, source: event.source, switchesReset: true });
+		await persistSessionMemory({ switches: 0, target: undefined, lastSwitchAt: 0 });
+	});
+
 	// ---- startup ----------------------------------------------------------
 	pi.on("session_start", async (event, ctx) => {
+		// Identity first: everything below is per conversation.
+		const currentKey = sessionKeyFromFile(ctx.sessionManager?.getSessionFile?.()) ?? ephemeralSessionKey();
+		const inherited = inheritedSessionKey(event.reason, currentKey, event.previousSessionFile);
+		const restoreKey = inherited ?? currentKey;
+		sessionKey = currentKey;
 		samples = [];
 		pending = [];
 		switchCount = 0;
 		switchTarget = undefined;
+		autoSwitchTo = undefined;
 		lastSwitchAt = 0;
 		lastNoTargetAt = 0;
 		turnCount = 0;
@@ -1112,6 +1345,34 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		clearStall();
 		config = await loadConfig();
 		lastActivityAt = 0;
+
+		// Reload, resume and fork continue an existing conversation. Restoring its switch
+		// memory is the difference between "this session already used 2 of its 3 switches and
+		// is on dsf2" and a fresh extension instance that thinks the budget is untouched.
+		const continuing = event.reason === "reload" || event.reason === "resume" || event.reason === "fork";
+		if (continuing) {
+			const state = await readSwitchState();
+			const memory = state.sessions?.[restoreKey];
+			if (memory) {
+				switchCount = memory.switches ?? 0;
+				switchTarget = memory.target;
+				lastSwitchAt = memory.lastSwitchAt ?? 0;
+				sessionStartedAt = memory.startedAt || sessionStartedAt;
+			}
+			samples = await restoreSessionSamples(restoreKey);
+			turnCount = samples.length;
+			if (inherited && memory) await writeSwitchState(rekeySession(state, inherited, currentKey, Date.now()));
+			await appendLog({
+				kind: "session-start",
+				reason: event.reason,
+				restoredFrom: restoreKey === currentKey ? undefined : restoreKey,
+				samples: samples.length,
+				switches: switchCount,
+				target: switchTarget,
+			});
+		} else {
+			void persistSessionMemory({ switches: 0, target: undefined, lastSwitchAt: 0, abandoned: [] });
+		}
 		// The sampler is armed for every session (parent or child): whichever session is open
 		// keeps the pool's rolling window fresh, and the lease file stops duplicates.
 		if (event.reason !== "reload") startSampler(ctx);
@@ -1142,18 +1403,22 @@ export default function modelSpeed(pi: ExtensionAPI) {
 					.filter((model) => model.provider === current.provider)
 					.map((model) => model.id),
 			);
-			// Prefer the rolling window for the warning: a stale external probe can name a model
-			// "failed" minutes after the window saw it answer fine.
+			// Prefer the rolling window for the warning, but only its *fresh* verdict: a warning
+			// built from a 6 h median misses the pool that degraded in the last 30 minutes.
 			const slowStats = [...stats.values()]
-				.filter((stat) => stat.provider === current.provider && selectable.has(stat.model) && (stat.ttftMs ?? 0) > config.thresholds.ttftSmallMs)
-				.map((stat) => `${stat.model}=${fmtMs(stat.ttftMs)}${stat.errors ? ` (${stat.errors} err)` : ""}`);
+				.filter((stat) => {
+					if (stat.provider !== current.provider || !selectable.has(stat.model)) return false;
+					const fresh = statVerdict(stat, 0);
+					return fresh.source !== "stale" && (fresh.ttftMs ?? 0) > config.thresholds.ttftSmallMs;
+				})
+				.map((stat) => `${stat.model}=${fmtMs(statVerdict(stat, 0).ttftMs)}${stat.errors ? ` (${stat.errors} err)` : ""}`);
 			const covered = new Set([...stats.values()].filter((stat) => stat.provider === current.provider).map((stat) => stat.model));
 			const slowProbe = Object.entries(probe?.models ?? {})
 				.filter(([id]) => selectable.has(id) && !covered.has(id))
 				.filter(([, value]) => value.ok === false || (value.ttft ?? 0) * 1000 > config.thresholds.ttftSmallMs)
 				.map(([id, value]) => (value.ok === false ? `${id}=failed(${value.status ?? "?"})` : `${id}=${fmtMs((value.ttft ?? 0) * 1000)}`));
 			const slow = [...slowStats, ...slowProbe];
-			const mineSlow = mine && ((mine.ttftMs ?? 0) > config.thresholds.ttftSmallMs || mine.errors > mine.n);
+			const mineSlow = mine && ((statVerdict(mine, 0).ttftMs ?? 0) > config.thresholds.ttftSmallMs || mine.errors > mine.n);
 			if (slow.length > 0) {
 				ctx.ui.notify(
 					`[model-speed] slow models${ageMin === undefined ? "" : ` (measured ${ageMin} min ago)`}: ${slow.join(", ")}` +
@@ -1175,7 +1440,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const currentId = ctx.model?.id;
 		const lines = ranking.candidates.map(
 			(candidate) =>
-				`${candidate.id === currentId ? "*" : " "} ${candidate.id}: ${fmtMs(candidate.ttftMs)}${candidate.tokensPerSec !== undefined ? ` · ${Math.round(candidate.tokensPerSec)} tok/s` : ""}${candidate.source === "none" ? "" : ` (${candidate.source})`}`,
+				`${candidate.id === currentId ? "*" : " "} ${candidate.id}: ${fmtMs(candidate.ttftMs)}${candidate.tokensPerSec !== undefined ? ` · ${Math.round(candidate.tokensPerSec)} tok/s` : ""}${candidate.source === "none" ? "" : ` (${candidate.source}${candidate.source === "stale" ? ` ${fmtAgeSpan(candidate.ageMs)}` : ""})`}`,
 		);
 		for (const entry of ranking.excluded) {
 			lines.push(`  ${entry.id}: skipped, context window ${entry.contextWindow} < session ${ranking.needTokens} tokens`);
@@ -1190,11 +1455,18 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	const renderRecent = async (ctx: ExtensionContext) => {
 		const stats = await recentStats();
 		const currentProvider = ctx.model?.provider;
-		const list = sortedStats(stats, config.thresholds.largePromptTokens).sort((a, b) => {
-			const mine = (a.provider === currentProvider ? 0 : 1) - (b.provider === currentProvider ? 0 : 1);
-			if (mine !== 0) return mine;
-			return (a.ttftMs ?? a.ttftLargeMs ?? Number.POSITIVE_INFINITY) - (b.ttftMs ?? b.ttftLargeMs ?? Number.POSITIVE_INFINITY);
-		});
+		// Sort by the same verdict ranking trusts: freshest measurement first, stale last.
+		const list = sortedVerdicts(stats, {
+			now: Date.now(),
+			largePromptTokens: config.thresholds.largePromptTokens,
+			staleMs: config.stats.staleMs,
+		})
+			.map((entry) => entry.stat)
+			.sort((a, b) => {
+				const mine = (a.provider === currentProvider ? 0 : 1) - (b.provider === currentProvider ? 0 : 1);
+				if (mine !== 0) return mine;
+				return (statVerdict(a, 0).ttftMs ?? Number.POSITIVE_INFINITY) - (statVerdict(b, 0).ttftMs ?? Number.POSITIVE_INFINITY);
+			});
 		const windowH = Math.round(config.stats.windowMs / 360_000) / 10;
 		const lines = list.map((stat) => `${stat.provider === currentProvider ? "*" : " "} ${stat.model}: ${fmtStat(stat)}`);
 		ctx.ui.setWidget("model-speed", [`recent ${windowH}h (fastest first):`, ...lines.map((line) => `  ${line}`)], {
@@ -1254,7 +1526,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 					timeoutMs: config.sampling.timeoutMs,
 					gapMs: config.sampling.gapMs,
 					onOutcome: async (outcome) => {
-						if (outcome.error === "AbortError") return;
+						if (outcome.error === "AbortError" || /abort/i.test(String(outcome.error ?? ""))) return;
 						await appendLog({ pid: process.pid, ...outcome });
 					},
 				});
@@ -1299,6 +1571,15 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				}));
 			}
 			ctx.ui.notify(`[model-speed] ${[...recent, ...session].join(" | ") || "no samples yet"}`, "info");
+			const memory = (await readSwitchState()).sessions?.[sessionKey];
+			if (memory && (memory.switches > 0 || memory.target)) {
+				ctx.ui.notify(
+					`[model-speed] this session already used ${memory.switches}/${config.maxSwitchesPerSession} switch(es)` +
+						(memory.target ? `, now on ${memory.target}` : "") +
+						` — remembered across reload/resume (${fmtAgeSpan(memory.updatedAt ? Date.now() - memory.updatedAt : undefined)})`,
+					"info",
+				);
+			}
 		},
 	});
 
@@ -1326,6 +1607,8 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		clearStall();
 		stopSampler();
 		sessionCtx = undefined;
-		if (samples.length) await appendLog({ kind: "session-end", samples: samples.length });
+		// Flush the per-session switch memory before the process state disappears.
+		await persistSessionMemory();
+		if (samples.length) await appendLog({ kind: "session-end", samples: samples.length, switches: switchCount });
 	});
 }

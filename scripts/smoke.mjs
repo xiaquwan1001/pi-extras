@@ -12,7 +12,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -343,6 +343,113 @@ check("model-speed: a pi-subagents child cannot switch models", () => {
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /pinned off/);
 	assert.match(result.stdout, /pi-subagents/);
+});
+
+// The switch budget and the model a session stepped onto must survive a reload/resume:
+// a fresh extension instance that forgets them hands a resumed conversation a new budget
+// and a legal path back to the model it just left.
+check("model-speed: a reloaded session remembers its switch budget", () => {
+	const state = mkdtempSync(join(tmpdir(), "pi-extras-ms-state-"));
+	const config = join(state, "config.json");
+	writeFileSync(config, JSON.stringify({ auto: true, providers: ["custom.ustc-pool"], probe: {}, sampling: { enabled: false } }));
+	const key = "2026-11-24T12-00_sess1";
+	const now = Date.now();
+	// Recent enough that `evaluateStreak` treats them as a live streak (`streakMaxAgeMs`).
+	const slow = (ageMs) => JSON.stringify({ kind: "sample", session: key, model: "ustc-glm", provider: "custom.ustc-pool", ttftMs: 120_000, promptTokens: 4_000, startedAt: now - 120_000 - ageMs, endedAt: now - ageMs });
+	writeFileSync(join(state, "speed-log.jsonl"), [slow(300_000), slow(200_000), slow(100_000)].join("\n") + "\n");
+	writeFileSync(
+		join(state, "switch-state.json"),
+		JSON.stringify({
+			sessions: {
+				[key]: { switches: 3, target: "ustc-dsf2", lastSwitchAt: 1_000, startedAt: 900, abandoned: [{ from: "ustc-dsf", to: "ustc-dsf2", at: 1_000 }], updatedAt: 1_000 },
+			},
+		}),
+	);
+	const script = `
+		const modelSpeed = await import(${JSON.stringify(new URL("../packages/model-speed/extensions/index.ts", import.meta.url).href)});
+		const handlers = new Map();
+		const notes = [];
+		let switched = null;
+		const model = { id: "ustc-dsf2", provider: "custom.ustc-pool" };
+		const ctx = {
+			model,
+			ui: { notify: (m) => notes.push(m), setStatus: () => {}, setWidget: () => {} },
+			sessionManager: { getSessionFile: () => "/sessions/${key}.jsonl" },
+			modelRegistry: {
+				getAvailable: () => [model, { id: "ustc-dsf", provider: "custom.ustc-pool" }, { id: "ustc-dsf2", provider: "custom.ustc-pool" }],
+				find: (_p, id) => ({ id, provider: "custom.ustc-pool" }),
+			},
+			getContextUsage: () => ({ tokens: 4_000 }),
+		};
+		modelSpeed.default({
+			on: (name, fn) => handlers.set(name, fn),
+			registerCommand: () => {},
+			setModel: async (target) => { switched = target.id; return true; },
+		});
+		await handlers.get("session_start")({ reason: "reload", previousSessionFile: "/sessions/${key}.jsonl" }, ctx);
+		await handlers.get("turn_end")({}, ctx);
+		process.stdout.write(JSON.stringify({ switched, notes }));
+	`;
+	const env = { ...process.env, PI_MODEL_SPEED_DIR: state, PI_MODEL_SPEED_CONFIG: config, PI_MODEL_SPEED_SAMPLING: "0" };
+	for (const k of ["PI_FABRIC_LINEAGE", "PI_SUBAGENT_CHILD", "PI_MODEL_SPEED_ALLOW_CHILD"]) delete env[k];
+	const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], { env, encoding: "utf8" });
+	assert.equal(result.status, 0, result.stderr);
+	const out = JSON.parse(result.stdout);
+	// The budget was already spent before the reload. A fresh instance would see 0/3 and
+	// switch again; the restored session refuses, and never steps onto `ustc-dsf`, which it
+	// abandoned one switch ago.
+	assert.equal(out.switched, null, "a resumed session keeps its spent switch budget");
+	const log = readFileSync(join(state, "speed-log.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	const skip = log.filter((entry) => entry.kind === "switch-skip").at(-1);
+	assert.ok(skip, "the refusal is logged");
+	assert.match(skip.reason, /switch budget spent \(3\/3\)/);
+	rmSync(state, { recursive: true, force: true });
+});
+
+// Ranking must read the fresh measurement, not the 6 h median: with long idle gaps the
+// median is a museum piece that names a model fast long after it went slow.
+check("model-speed: a fresh slow probe outranks an old fast median", () => {
+	const state = mkdtempSync(join(tmpdir(), "pi-extras-ms-window-"));
+	const config = join(state, "config.json");
+	writeFileSync(config, JSON.stringify({ auto: false, probe: {}, sampling: { enabled: false }, stats: { windowMs: 21_600_000, recentMs: 1_800_000, staleMs: 3_600_000 } }));
+	const now = Date.now();
+	const probe = (ttftMs, ageMs) =>
+		JSON.stringify({
+			kind: "probe",
+			session: "old",
+			model: "ustc-glm",
+			provider: "custom.ustc-pool",
+			ttftMs,
+			promptTokens: 2_000,
+			startedAt: now - ageMs - ttftMs,
+			endedAt: now - ageMs,
+		});
+	const lines = [probe(1_123, 3 * 3_600_000), probe(1_145, 2 * 3_600_000), probe(1_407, 3_600_000), probe(10_218, 60_000)];
+	writeFileSync(join(state, "speed-log.jsonl"), lines.join("\n") + "\n");
+	const script = `
+		const modelSpeed = await import(${JSON.stringify(new URL("../packages/model-speed/extensions/index.ts", import.meta.url).href)});
+		const handlers = new Map();
+		const commands = new Map();
+		const notes = [];
+		const model = { id: "ustc-dsf", provider: "custom.ustc-pool" };
+		const ctx = {
+			model,
+			ui: { notify: (m) => notes.push(m), setStatus: () => {}, setWidget: () => {} },
+			sessionManager: { getSessionFile: () => undefined },
+			modelRegistry: { getAvailable: () => [model, { id: "ustc-glm", provider: "custom.ustc-pool" }], find: (_p, id) => ({ id, provider: "custom.ustc-pool" }) },
+			getContextUsage: () => ({ tokens: 2_000 }),
+		};
+		modelSpeed.default({ on: (n, f) => handlers.set(n, f), registerCommand: (id, d) => commands.set(id, d), setModel: async () => true });
+		await commands.get("speed").handler("", ctx);
+		process.stdout.write(notes.join("\\n"));
+	`;
+	const env = { ...process.env, PI_MODEL_SPEED_DIR: state, PI_MODEL_SPEED_CONFIG: config, PI_MODEL_SPEED_SAMPLING: "0" };
+	for (const k of ["PI_FABRIC_LINEAGE", "PI_SUBAGENT_CHILD", "PI_MODEL_SPEED_ALLOW_CHILD"]) delete env[k];
+	const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], { env, encoding: "utf8" });
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /ustc-glm: TTFT 10\.2s/, result.stdout);
+	assert.doesNotMatch(result.stdout, /ustc-glm: TTFT 1\.4s/, result.stdout);
+	rmSync(state, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------- fabric-resume

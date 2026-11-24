@@ -15,7 +15,17 @@ Two details that make the numbers trustworthy rather than decorative:
 - The anchor is `before_provider_request`, not `message_start`. `message_start` fires after the response headers, so counting from it reports a TTFT of ~0 for every request.
 - Timings are queued, so overlapping requests (retries, nested calls, compaction) do not clobber each other.
 
-Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl`, and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed-stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
+Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl` (every line carries the `session` it belongs to), and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed-stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
+
+**A six-hour median is not a verdict.** With sparse sampling — long idle gaps between sessions — a fresh 10.2 s measurement used to lose against four 1.3 s measurements from hours earlier, so the model that had just gone slow still ranked as the fast one (`ustc-glm`, 2026-11-24: window median 1.4 s, newest probe 10.2 s, ranked second-fastest). The window keeps those medians for context, but everything that *decides* something reads a verdict over the **recency cohort** (`stats.recentMs`, default = one `sampling.intervalMs`):
+
+1. the recent cohort when it has a timed sample — one fresh reading beats any number of old ones,
+2. otherwise the window median, if the newest sample is inside `stats.staleMs` (default 2 × the cohort),
+3. otherwise **no TTFT at all** and the model is reported `stale`; a stale fast number is not a candidate, so the switch logic says "nothing clearly faster is known" instead of walking onto a slow model.
+
+A fresh **failure** counts the same as a fresh slow reading: if the newest sample in the cohort is a timeout or an HTTP error, the model is unrankable until it answers again — the failure is the newest thing known about it.
+
+The external probe file has the same rule via `probe.maxAgeMs`: past that age it is history, shown in `/speed` but never used as a ranking source.
 
 **The pool is sampled automatically.** Real turns only measure the model in use, so a model nobody selected would stay unmeasured forever. When the session has been idle for `sampling.idleMs` and a model's newest synthetic sample is older than `sampling.intervalMs`, the extension sends one small timed request through `ctx.modelRegistry.streamSimple()` — the same credentials Pi uses, so no probe script and no API key in a config file — and records TTFT plus tokens/s as a `kind:"probe"` line. Details that keep this honest and cheap:
 
@@ -39,6 +49,8 @@ Staleness is judged per sample from the time it **ended** (`streakMaxAgeMs`), ne
 The timer is cleared on the first payload delta and at `message_end`/`turn_end`, so a slow-but-streaming turn is left to the streak logic.
 
 Guards: once per `cooldownMs`, at most once per session, skipped while a manual `/model` is driving, the target must **clearly** be faster (`minImprovementRatio` / `minImprovementMs`) — a 13 s → 12 s "win" is not worth re-billing the prompt — and the target must **fit the session's context** (see below).
+
+**A session remembers what it already did.** The budget, the model the last automatic switch landed on, and the models this conversation abandoned are per session and persisted to `switch-state.json` (`sessions.<key>`), keyed by the session file name. Reload, `--resume` and fork restore them — plus this session's timed samples from the log — so a resumed conversation does not get a fresh budget and does not step back onto the model it just left. A *manual* `/model` still resets the budget (`model_select` with a model that is not ours); `/new` starts a conversation with no inherited memory, `/speed-stats` shows what was remembered.
 
 **Fast is not the same as usable.** A provider often mixes windows: a fast 256k model next to a slow 1M one. Letting speed alone pick the target hands a 300k-token session the 256k model, and the turn dies on a `400 ContextWindowExceededError` (inside a Fabric child, the whole run dies). Targets whose declared `contextWindow` is below the session's current tokens (from `getContextUsage()` and the largest prompt this session has already sent) plus `contextGuard.headroomTokens` are skipped, and both the switch notification and `/speed` say so.
 
@@ -64,7 +76,7 @@ Restart Pi (or `/reload`).
 | --- | --- |
 | `/speed` | Rolling window of recent TTFT / tokens-per-second per model, plus the ranked candidates; refreshes stale models in the background |
 | `/speed-probe` | Sample the stale pool models now (background); `/speed-probe --force` ignores freshness; `/speed-probe <model…>` samples exactly those; `--external` runs the legacy probe script |
-| `/speed-stats` | This session's TTFT/TPOT medians plus the rolling recent window |
+| `/speed-stats` | This session's TTFT/TPOT medians, the remembered switch budget, and the rolling recent window |
 | `/speed-auto on\|off` | Toggle failover for this session |
 
 ## Configuration
@@ -112,10 +124,11 @@ Optional file `~/.pi/agent/model-speed.json`:
     "providers": [],
     "models": []
   },
-  "stats": { "windowMs": 21600000 },
+  "stats": { "windowMs": 21600000, "recentMs": 1800000, "staleMs": 3600000 },
   "probe": {
     "command": ["bash", "/home/me/bin/model-probe.sh"],
-    "file": "/home/me/.cache/model-probe.json"
+    "file": "/home/me/.cache/model-probe.json",
+    "maxAgeMs": 3600000
   }
 }
 ```
@@ -155,15 +168,18 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `sampling.gapMs` | `400` | Pause between samples, so one gateway is not probed concurrently |
 | `sampling.providers` | `[]` | Providers to sample; empty = `providers`, then the current session's provider |
 | `sampling.models` | `[]` | Model ids or `provider/id` to sample; empty = every model of those providers |
-| `stats.windowMs` | `21600000` | Rolling window used by `/speed`, ranking and `stats.json` (6 h) (`PI_MODEL_SPEED_STATS_WINDOW_MS`) |
+| `stats.windowMs` | `21600000` | Rolling window used for the medians in `/speed` and `stats.json` (6 h) (`PI_MODEL_SPEED_STATS_WINDOW_MS`) |
+| `stats.recentMs` | = `sampling.intervalMs` | Recency cohort that decides the verdict ranking uses (`PI_MODEL_SPEED_RECENT_MS`; `0` = always use the whole window) |
+| `stats.staleMs` | = 2 × `stats.recentMs` | No measurement newer than this means the model is *unknown*, never "fast" (`PI_MODEL_SPEED_STALE_MS`) |
 | `probe.command` | — | Legacy external probe, only run by `/speed-probe --external` |
 | `probe.file` | — | That probe's output: `{ "ts": 1700000000, "models": { "<id>": { "ok": true, "ttft": 1.2 } } }` (`ttft` in seconds) |
+| `probe.maxAgeMs` | `3600000` | A probe file older than this is shown but not ranked (`PI_MODEL_SPEED_PROBE_MAX_AGE_MS`) |
 
-Environment overrides: `PI_MODEL_SPEED=0` (disable), `PI_MODEL_SPEED_SAMPLING=0` (disable only pool sampling), `PI_MODEL_SPEED_DIR` (state dir), `PI_MODEL_SPEED_CONFIG` (config path), `PI_MODEL_SPEED_SLOW_MS`, `PI_MODEL_SPEED_SLOW_LARGE_MS`, `PI_MODEL_SPEED_SLOW_TPOT_MS`, `PI_MODEL_SPEED_SLOW_WALL_MS`, `PI_MODEL_SPEED_STALL_MS`, `PI_MODEL_SPEED_STREAK_MAX_AGE_MS`, `PI_MODEL_SPEED_WINDOW`, `PI_MODEL_SPEED_CONTEXT_GUARD=0`, `PI_MODEL_SPEED_SAMPLING_INTERVAL_MS`, `PI_MODEL_SPEED_STATS_WINDOW_MS`.
+Environment overrides: `PI_MODEL_SPEED=0` (disable), `PI_MODEL_SPEED_SAMPLING=0` (disable only pool sampling), `PI_MODEL_SPEED_DIR` (state dir), `PI_MODEL_SPEED_CONFIG` (config path), `PI_MODEL_SPEED_SLOW_MS`, `PI_MODEL_SPEED_SLOW_LARGE_MS`, `PI_MODEL_SPEED_SLOW_TPOT_MS`, `PI_MODEL_SPEED_SLOW_WALL_MS`, `PI_MODEL_SPEED_STALL_MS`, `PI_MODEL_SPEED_STREAK_MAX_AGE_MS`, `PI_MODEL_SPEED_WINDOW`, `PI_MODEL_SPEED_CONTEXT_GUARD=0`, `PI_MODEL_SPEED_SAMPLING_INTERVAL_MS`, `PI_MODEL_SPEED_STATS_WINDOW_MS`, `PI_MODEL_SPEED_RECENT_MS`, `PI_MODEL_SPEED_STALE_MS`, `PI_MODEL_SPEED_PROBE_MAX_AGE_MS`.
 
 ## Choosing a ranking source
 
-Ranking uses, in order: the rolling window (median TTFT from real turns plus synthetic samples inside `stats.windowMs`), then an external probe file for models the window has never seen, then "unknown". Unknown models are never picked as a switch target — the extension says "no faster same-provider model is known yet" and leaves you where you are.
+Ranking uses, in order: the **verdict** from the rotation window (recency cohort first, whole window second — real turns and synthetic samples alike), then a *fresh* external probe file for models the window has never seen, then "unknown". `stale` and unknown models are never picked as a switch target — the extension says "no faster same-provider model is known yet" and leaves you where you are, which is the correct answer when the only number available describes an hour ago.
 
 Recent measured data deliberately outranks an external probe file: a probe with a cold 2 k prompt can report 0.3 s while the same model serves this session in 6 s, and the rolling window is what users actually felt. Token speed travels with the ranking, so a model that answers quickly but generates at 9 tok/s is visibly unappealing in `/speed`.
 
@@ -176,13 +192,15 @@ Recent measured data deliberately outranks an external probe file: a probe with 
 | `sample` | One timed real request (TTFT/TPOT, prompt/output tokens, `longCall` for hangs) |
 | `probe` | One timed synthetic pool sample (TTFT, TPOT, tokens/s, `tokensOut`, `error`/`status` on failure) |
 | `stall` | A request produced no first token for `stallMs` (`attempt` 1 = notify+switch, 2 = abort) |
-| `switch` | The switch that happened (`from`/`to`, `reason` = `slow` or `stall`) |
+| `switch` | The switch that happened (`from`/`to`, `reason` = `slow` or `stall`, `switches` = budget used) |
+| `session-start` | A reload/resume/fork restored memory (`restoredFrom`, `samples`, `switches`, `target`) |
+| `model-select` | The user changed the model, so the switch budget was cleared |
 | `switch-skip` | Why it did **not** happen: `auto off`, `switch budget spent`, `switch cooldown`, `provider … not in allowlist`, `fabric child` / `subagent child`, `target … missing from registry`, `setModel(…) refused`, or `no clearly faster same-provider target` — the last one also logs the ranking it saw (`ranked`, `excluded`, `needTokens`, `currentMedian`) |
 
-`sampler-state.json` carries the lease (`lastRunAt`) and the last run summary; `stats.json` is the rolling window at the last write. `/speed` shows medians; `/speed-stats` adds the session.
+`sampler-state.json` carries the lease (`lastRunAt`) and the last run summary; `stats.json` is the rolling window at the last write; `switch-state.json` holds the global history plus `sessions.<key>` (per-conversation budget, target and abandoned models, pruned to the 20 newest). Every log line carries `session`, so `grep <session-key>` answers "what did this conversation experience, and what did it switch to".
 
 ```bash
-node --test packages/model-speed/tests/*.test.mjs   # failover decision + rolling-window math
+node --test packages/model-speed/tests/*.test.mjs   # failover decision, verdicts, session memory
 ```
 
 ## Notes and limits
