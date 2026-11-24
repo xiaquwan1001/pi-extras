@@ -78,12 +78,21 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /**
- * Fabric child sessions are launched on a model their parent named, and pi-fabric's
- * strict model admission treats any later drift as a protocol violation and terminates
- * the child ("requested X, but assistant reports Y; terminating child"). A failover
- * switch inside a child therefore destroys work rather than rescuing it, so automatic
- * switching is off whenever this process is a Fabric child. Sampling stays on: the
- * child's samples still feed the shared history that ranking uses.
+ * A child session is launched on the model its parent named, and the parent treats any
+ * later drift as a protocol violation and fails the run. So automatic switching is off
+ * whenever this process is a child. Sampling stays on: the child's samples still feed
+ * the shared history that ranking uses.
+ *
+ * Native pi-subagents children (`PI_SUBAGENT_CHILD=1`, set by the background runner)
+ * are the live case: pi-subagents verifies every assistant message against the launch
+ * candidate and fails the whole run with `model_verification_failed` ("Expected
+ * 'custom.ustc-pool/ustc-glm:high' but observed 'ustc-dsf2'") even though the work
+ * finished. That is exactly what a mid-run failover produces (2026-11-24, run
+ * e5a8e44a: child switched glm→dsf2 at 15:59:31, review delivered, run failed).
+ *
+ * Pi Fabric was uninstalled on 2026-11-24; its `PI_FABRIC_*` lineage markers are kept
+ * only as a no-op guard in case it ever comes back (same failure mode: strict model
+ * admission terminates the child).
  *
  * Set PI_MODEL_SPEED_ALLOW_CHILD=1 to opt back in for debugging.
  */
@@ -93,6 +102,11 @@ const FABRIC_CHILD = Boolean(
 		process.env.PI_FABRIC_AGENT_NAME ||
 		process.env.PI_FABRIC_MODEL_PIN,
 );
+/** Set by pi-subagents' background runner and by nested native children. */
+const SUBAGENT_CHILD = Boolean(
+	process.env.PI_SUBAGENT_CHILD === "1" || Number(process.env.PI_SUBAGENT_DEPTH || 0) >= 1,
+);
+const PINNED_CHILD = FABRIC_CHILD || SUBAGENT_CHILD;
 const AUTO_IN_CHILD = process.env.PI_MODEL_SPEED_ALLOW_CHILD === "1";
 
 const CONFIG_PATH = process.env.PI_MODEL_SPEED_CONFIG?.trim() || join(homedir(), ".pi", "agent", "model-speed.json");
@@ -135,7 +149,7 @@ const num = (value: unknown, fallback: number) => {
 };
 
 const DEFAULT_CONFIG: Config = {
-	auto: process.env.PI_MODEL_SPEED !== "0" && !(FABRIC_CHILD && !AUTO_IN_CHILD),
+	auto: process.env.PI_MODEL_SPEED !== "0" && !(PINNED_CHILD && !AUTO_IN_CHILD),
 	providers: [],
 	candidates: [],
 	thresholds: { ttftSmallMs: 12_000, ttftLargeMs: 25_000, largePromptTokens: 30_000, tpotMs: 250, turnWallMs: 90_000, stallMs: 180_000 },
@@ -194,6 +208,15 @@ let turnCount = 0;
 /** Stall watchdog state: one timer for the request in flight, one context for its session. */
 let stallTimer: ReturnType<typeof setTimeout> | undefined;
 let stallFired = 0;
+/**
+ * True when this in-flight request already triggered a failover switch. The switch
+ * cannot rescue the hung request itself, and aborting it is a hard exit — pi's retry
+ * machinery only runs on *errors*, not aborts — so the second stall window must not
+ * abort a request we already moved away from. limbus, 2026-11-25: stall → switch
+ * dsf→glm at 3 min, then the watchdog aborted the same dead dsf request at 6 min,
+ * killing the turn the switch was supposed to save.
+ */
+let switchedDuringStall = false;
 let liveCtx: ExtensionContext | undefined;
 let liveApi: ExtensionAPI | undefined;
 let disposed = false;
@@ -207,7 +230,7 @@ async function loadConfig(): Promise<Config> {
 	}
 	const thresholds = { ...DEFAULT_CONFIG.thresholds, ...(raw.thresholds ?? {}) };
 	const envThreshold = (name: string, fallback: number) => num(process.env[name], fallback);
-	const disabled = process.env.PI_MODEL_SPEED === "0" || (FABRIC_CHILD && !AUTO_IN_CHILD);
+	const disabled = process.env.PI_MODEL_SPEED === "0" || (PINNED_CHILD && !AUTO_IN_CHILD);
 	const window = Math.max(2, Math.floor(num(process.env.PI_MODEL_SPEED_WINDOW, num(raw.window, 3))));
 	return {
 		auto: disabled ? false : (raw.auto ?? DEFAULT_CONFIG.auto) !== false,
@@ -527,9 +550,9 @@ async function switchToFaster(
 	if (!current) return skip("no current model");
 	if (!config.auto) return skip("auto off");
 	if (switchCount >= config.maxSwitchesPerSession) return skip(`switch budget spent (${switchCount}/${config.maxSwitchesPerSession})`);
-	// Hard stop for Fabric children: a switch here is read as model drift by the
-	// parent and ends the run (see FABRIC_CHILD above). `/speed-auto on` cannot undo it.
-	if (FABRIC_CHILD && !AUTO_IN_CHILD) return skip("fabric child");
+	// Hard stop for pinned children: a switch here is read as model drift by the
+	// parent and ends the run (see PINNED_CHILD above). `/speed-auto on` cannot undo it.
+	if (PINNED_CHILD && !AUTO_IN_CHILD) return skip(SUBAGENT_CHILD ? "subagent child" : "fabric child");
 	// Per *session* pacing: one session's switch must not freeze every other session,
 	// which is what the shared lastSwitchAt file used to do.
 	if (Date.now() - lastSwitchAt < config.switchCooldownMs) return skip("switch cooldown");
@@ -637,11 +660,25 @@ async function onStall(): Promise<void> {
 		ctx.ui.notify(`[model-speed] ${sample.model}: no first token for ${fmtMs(waited)} (hung gateway, not slow)`, "warning");
 		// A hung request cannot be sped up, but the next one can move: switch now so the
 		// retry (or the following turn) leaves the dead model instead of re-paying the wait.
-		await switchToFaster(pi, ctx, { tail: [{ ...sample, ttftMs: waited }], bound: sessionBound() }, "stall");
+		const switched = await switchToFaster(pi, ctx, { tail: [{ ...sample, ttftMs: waited }], bound: sessionBound() }, "stall");
+		switchedDuringStall = switched;
 		armStall();
 		return;
 	}
-	// Still nothing after a second window: stop silently waiting out Pi's HTTP idle timeout
+	// Already failed over mid-stall: aborting here is a hard exit that pi's retry machinery
+	// does not run on, so it would throw away the turn the switch was meant to save. Park
+	// the watchdog instead — pi's own HTTP idle timeout turns the dead request into a real
+	// error, which *is* retried, and the retry lands on the model we switched to.
+	if (switchedDuringStall) {
+		ctx.ui.notify(
+			`[model-speed] still no first token after ${fmtMs(waited)} on the hung request; already switched models — leaving it to pi's idle timeout + retry instead of aborting`,
+			"warning",
+		);
+		await appendLog({ kind: "stall-parked", pid: process.pid, model: sample.model, waitedMs: waited });
+		clearStall();
+		return;
+	}
+	// Still nothing after a second window and no way out: stop silently waiting out Pi's HTTP idle timeout
 	// (20 min here). Aborting ends the turn — for an async subagent that is also what wakes
 	// the parent up, instead of an hour of silence.
 	ctx.ui.notify(`[model-speed] ${sample.model}: still no first token after ${fmtMs(waited)}; aborting this turn so the run reports instead of hanging`, "error");
@@ -690,6 +727,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		// in this extension gets a chance to act on a hung gateway.
 		liveCtx = ctx;
 		stallFired = 0;
+		switchedDuringStall = false;
 		armStall();
 	});
 
@@ -895,10 +933,10 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				return;
 			}
 			config = { ...config, auto: arg === "on" };
-			const pinned = FABRIC_CHILD && !AUTO_IN_CHILD;
+			const pinned = PINNED_CHILD && !AUTO_IN_CHILD;
 			ctx.ui.notify(
 				pinned
-					? "[model-speed] auto failover is pinned off in Fabric child sessions (a mid-run switch terminates the run); sampling continues"
+					? `[model-speed] auto failover is pinned off in ${SUBAGENT_CHILD ? "pi-subagents" : "Fabric"} child sessions (a mid-run switch makes the parent report model drift and fails the run); sampling continues`
 					: `[model-speed] auto failover ${config.auto ? "on" : "off"} for this session`,
 				"info",
 			);

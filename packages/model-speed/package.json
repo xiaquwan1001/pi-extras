@@ -1,6 +1,6 @@
 {
   "name": "pi-model-speed",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Measure real TTFT/TPOT in Pi, and automatically step off a model that is consistently slow within the same provider.",
   "type": "module",
   "license": "MIT",

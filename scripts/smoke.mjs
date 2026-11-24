@@ -326,6 +326,25 @@ rmSync(root, { recursive: true, force: true });
 	}
 }
 
+// A pi-subagents child is launched on a model its parent named, and the run is failed
+// with model_verification_failed if the child then reports a different one. Same pin.
+check("model-speed: a pi-subagents child cannot switch models", () => {
+	const script = `
+		const modelSpeed = await import(${JSON.stringify(new URL("../packages/model-speed/extensions/index.ts", import.meta.url).href)});
+		const commands = new Map();
+		const notices = [];
+		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition) });
+		await commands.get("speed-auto").handler("on", { ui: { notify: (m) => notices.push(m) } });
+		process.stdout.write(notices.at(-1) ?? "");
+	`;
+	const env = { ...process.env, PI_SUBAGENT_CHILD: "1" };
+	for (const key of ["PI_FABRIC_LINEAGE", "PI_FABRIC_DEPTH", "PI_FABRIC_AGENT_NAME", "PI_FABRIC_MODEL_PIN", "PI_MODEL_SPEED_ALLOW_CHILD"]) delete env[key];
+	const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script], { env, encoding: "utf8" });
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /pinned off/);
+	assert.match(result.stdout, /pi-subagents/);
+});
+
 // ---------------------------------------------------------------- fabric-resume
 {
 	const { createHash } = await import("node:crypto");

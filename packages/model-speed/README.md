@@ -33,7 +33,7 @@ Guards: once per `cooldownMs`, at most once per session, skipped while a manual 
 
 **A warm session is expensive to leave.** Switching models discards the gateway's prefix cache and re-pays for the whole prompt, so a session that has already run `sessionBinding.warmTurns` turns (or `warmAfterMs` of wall time, or one turn whose prompt is past `thresholds.largePromptTokens`) is *bound*: its slow thresholds are multiplied by `boundThresholdMultiplier`, TTFT never triggers a switch below `boundMinTtftMs`, and the switch log/notification says `session bound`. A bound session stays on a model that is 20% slower, and still walks away from one that stalls for a minute.
 
-**Never inside a Fabric child.** A process launched by `fabric_exec` (it carries `PI_FABRIC_LINEAGE` / `PI_FABRIC_DEPTH`) keeps the model its parent assigned: Pi Fabric's model admission reads a mid-run switch as drift. Sampling still runs there, so child timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging. The abort half of the stall watchdog still applies: it ends the turn, it does not change the model.
+**Never inside a child with a pinned model.** A background pi-subagents child (`PI_SUBAGENT_CHILD=1`, set by the runner) keeps the model its parent assigned: the parent verifies every assistant message against the launch candidate and fails the whole run with `model_verification_failed` ("Expected 'custom.ustc-pool/ustc-glm:high' but observed 'ustc-dsf2'") — even though the work finished. The same pin applies to any `PI_FABRIC_*` lineage marker; Pi Fabric was uninstalled in 2026-11-24, so the marker check is only a no-op compatibility guard. Sampling still runs in children, so their timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging. The abort half of the stall watchdog still applies: it ends the turn, it does not change the model.
 
 **Where it runs.** Ambient extensions load in the parent session and in *background* subagent children (`async: true`), which is where the stall watchdog earns its keep. Local *foreground* children (`async: false`) never load ambient extensions, so neither sampling nor failover happens there; opt in per agent with `subagentOnlyExtensions` when you need it.
 
@@ -138,7 +138,7 @@ The probe is deliberately *not* part of the package: timing a model means spendi
 | `sample` | One timed request (TTFT/TPOT, prompt tokens, `longCall` for hangs) |
 | `stall` | A request produced no first token for `stallMs` (`attempt` 1 = notify+switch, 2 = abort) |
 | `switch` | The switch that happened (`from`/`to`, `reason` = `slow` or `stall`) |
-| `switch-skip` | Why it did **not** happen: `auto off`, `switch budget spent`, `switch cooldown`, `provider … not in allowlist`, `fabric child`, `target … missing from registry`, `setModel(…) refused`, or `no clearly faster same-provider target` — the last one also logs the ranking it saw (`ranked`, `excluded`, `needTokens`, `currentMedian`) |
+| `switch-skip` | Why it did **not** happen: `auto off`, `switch budget spent`, `switch cooldown`, `provider … not in allowlist`, `fabric child` / `subagent child`, `target … missing from registry`, `setModel(…) refused`, or `no clearly faster same-provider target` — the last one also logs the ranking it saw (`ranked`, `excluded`, `needTokens`, `currentMedian`) |
 
 ```bash
 node --test packages/model-speed/tests/   # failover decision, replayed from real samples
