@@ -90,3 +90,29 @@ test("context need is estimated from the conversation, not from a tokenizer", ()
 	const noisy = estimateNeedTokens([{ id: "a".repeat(10_000), timestamp: 1, content: "x" }], 0);
 	assert.ok(noisy < 100);
 });
+
+test("CJK text is credited per character, not per four characters", () => {
+	// Measured on the gateway 2026-11-25: 840 Chinese characters counted as 967 input tokens.
+	// The old `chars / 4` gave 210, which would have handed a long Chinese session the 256k model.
+	const cjk = "重复一下这句话以填充上下文。".repeat(60);
+	const est = estimateNeedTokens([{ role: "user", content: cjk }], 0);
+	assert.ok(est > 800 && est < 1_200, `expected ~1 token/char (gateway said 967), got ${est}`);
+	// Mixed text stays between the two weights instead of collapsing to either extreme.
+	const mixed = estimateNeedTokens([{ role: "user", content: cjk + "x".repeat(4_000) }], 0);
+	assert.ok(mixed > est + 800 && mixed < est + 1_200, `latin part must add ~1000, got ${mixed - est}`);
+	// A 300k-token Chinese session must be over the 256k model's window on the estimate alone,
+	// with no live usage to fall back on (a resumed session's very first request).
+	const long = estimateNeedTokens([{ role: "user", content: "中".repeat(300_000) }], 0);
+	const choice = chooseRoute({
+		candidates: [
+			{ id: "qwen", order: 1, ttftMs: 300, contextWindow: 262_144 },
+			{ id: "dsf", order: 0, ttftMs: 900, contextWindow: 1_000_000 },
+		],
+		chain: ["dsf", "qwen"],
+		needTokens: long,
+		reason: "user",
+		now,
+		quarantineMs: 0,
+	});
+	assert.equal(choice?.modelId, "dsf", `a 300k CJK session must not land on the 256k model (est ${long})`);
+});

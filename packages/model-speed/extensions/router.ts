@@ -162,15 +162,30 @@ export function chooseRoute(input: RouteInput): RouteChoice | undefined {
 /**
  * Rough token count of a conversation, for the context guard in the router.
  *
- * Deliberately cheap: `route()` runs before every request, so it must not tokenize. Four
- * characters per token over-counts CJK and under-counts code, and the headroom absorbs both.
+ * Deliberately cheap: `route()` runs before every request, so it must not tokenize. ASCII and
+ * other latin text is estimated at four characters per token; CJK cannot be, and it is the
+ * common case here.
+ *
+ * The CJK weight is measured, not guessed: a 840-character Chinese prompt came back from the
+ * gateway's own counter as 967 input tokens (`_pre_call_checks` names the number), i.e. slightly
+ * more than one token per character. A flat `chars / 4` therefore under-counted a Chinese
+ * conversation by ~4.5x, which is the dangerous direction — an under-count makes the 256k model
+ * look like it fits, and the turn dies on `400 ContextWindowExceededError`. So CJK is credited
+ * at 1.1 tokens per character (rounded up) and the result is still max()-ed against live usage.
  */
+const CJK_RANGES = "\\u3000-\\u303f\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff00-\\uffef\\uac00-\\ud7af";
+const CJK_GLOBAL = new RegExp(`[${CJK_RANGES}]`, "g");
+const CJK_TOKENS_PER_CHAR = 1.1;
+
 export function estimateNeedTokens(messages: readonly unknown[], headroomTokens = 32_000): number {
 	let chars = 0;
+	let cjkChars = 0;
 	const seen = new Set<unknown>();
 	const walk = (value: unknown, depth: number) => {
 		if (depth > 8 || chars > 8_000_000) return;
 		if (typeof value === "string") {
+			const cjk = value.match(CJK_GLOBAL);
+			cjkChars += cjk ? cjk.length : 0;
 			chars += value.length;
 			return;
 		}
@@ -189,5 +204,6 @@ export function estimateNeedTokens(messages: readonly unknown[], headroomTokens 
 		}
 	};
 	walk(messages, 0);
-	return Math.round(chars / 4) + Math.max(0, headroomTokens);
+	const latinChars = chars - cjkChars;
+	return Math.round(latinChars / 4 + cjkChars * CJK_TOKENS_PER_CHAR) + Math.max(0, headroomTokens);
 }

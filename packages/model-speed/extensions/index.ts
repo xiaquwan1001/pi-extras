@@ -1775,7 +1775,11 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				return;
 			}
 			const stats = await recentStats();
-			const needTokens = estimateNeedTokens([], cfg.headroomTokens);
+			// Same rule as route(): live usage wins, the character estimate is the floor for a
+			// resumed session before the first response. With an empty estimate this command would
+			// advertise the 256k model as pickable for a 300k-token session and the next request
+			// would fail on it.
+			const needTokens = Math.max(Number(ctx.getContextUsage?.()?.tokens ?? 0), estimateNeedTokens([], 0)) + cfg.headroomTokens;
 			const registry = (sessionCtx?.modelRegistry ?? liveCtx?.modelRegistry) as never;
 			const lines = routeCandidates(registry).map((candidate) => {
 				const stat = stats.get(`${cfg.provider}/${candidate.id}`);
