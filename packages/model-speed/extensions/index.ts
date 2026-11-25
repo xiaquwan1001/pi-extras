@@ -103,6 +103,7 @@
  * PI_MODEL_SPEED_STALE_MS adjust the verdict cohorts.
  */
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { appendFile, mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -348,6 +349,15 @@ type ProbeFile = { ts?: number; models: Record<string, ProbeEntry> };
 
 let config: Config = DEFAULT_CONFIG;
 /**
+ * The virtual-model settings, available *synchronously*.
+ *
+ * `loadConfig()` is async (fs/promises), and the first request can go out before it resolves —
+ * a subagent child did exactly that: it sent `model=ustc-auto` to the gateway as an unknown
+ * custom id and got `400 Invalid model name` (2026-11-25). Registration and routing therefore
+ * read this holder, which a synchronous read fills at extension load.
+ */
+let virtualConfig: VirtualConfig = DEFAULT_CONFIG.virtual;
+/**
  * Identity of the conversation these counters belong to. The switch budget and the
  * abandoned-model list are per conversation, and they are persisted under this key so a
  * reload/resume/fork remembers what this session already did (see `sessions.ts`).
@@ -388,6 +398,40 @@ let sampling = false;
 let samplerAbort: AbortController | undefined;
 /** Last time a provider request started or finished; sampling waits for quiet. */
 let lastActivityAt = 0;
+
+/**
+ * Read the virtual-model block synchronously, from the same file and with the same defaults as
+ * `loadConfig()`. Used once at extension load so the router is registered before the first
+ * request, and again on `session_start` (where the async load takes over).
+ */
+function readVirtualConfigSync(): VirtualConfig {
+	let raw: any = {};
+	try {
+		raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8"))?.virtual ?? {};
+	} catch {
+		/* optional file */
+	}
+	const fallback = DEFAULT_CONFIG.virtual;
+	return {
+		// Pinning a child turns off automatic *switching* (see switchToFaster); the router is a
+		// per-request decision and must still register, or a child launched on the virtual model
+		// sends the virtual id upstream and gets `400 Invalid model name`.
+		enabled: process.env.PI_MODEL_SPEED === "0" ? false : raw.enabled === true,
+		provider: typeof raw.provider === "string" && raw.provider ? raw.provider : fallback.provider,
+		id: typeof raw.id === "string" && raw.id ? raw.id : fallback.id,
+		name: typeof raw.name === "string" && raw.name ? raw.name : fallback.name,
+		chain: Array.isArray(raw.chain) ? raw.chain.filter((v: unknown) => typeof v === "string") : [],
+		thinkingLevels:
+			Array.isArray(raw.thinkingLevels) && raw.thinkingLevels.length
+				? raw.thinkingLevels.filter((v: unknown) => typeof v === "string")
+				: [...fallback.thinkingLevels],
+		contextWindow: typeof raw.contextWindow === "number" ? raw.contextWindow : undefined,
+		maxTokens: typeof raw.maxTokens === "number" ? raw.maxTokens : undefined,
+		headroomTokens: Math.max(0, num(raw.headroomTokens, fallback.headroomTokens)),
+		quarantineMs: Math.max(0, num(raw.quarantineMs, fallback.quarantineMs)),
+		minGainRatio: Math.max(1, num(raw.minGainRatio, fallback.minGainRatio)),
+	};
+}
 
 async function loadConfig(): Promise<Config> {
 	let raw: Record<string, any> = {};
@@ -480,7 +524,8 @@ async function loadConfig(): Promise<Config> {
 			staleMs,
 		},
 		virtual: {
-			enabled: disabled ? false : raw.virtual?.enabled === true,
+			// Deliberately not gated on PINNED_CHILD: see readVirtualConfigSync().
+			enabled: process.env.PI_MODEL_SPEED === "0" ? false : raw.virtual?.enabled === true,
 			provider: typeof raw.virtual?.provider === "string" && raw.virtual.provider ? raw.virtual.provider : DEFAULT_CONFIG.virtual.provider,
 			id: typeof raw.virtual?.id === "string" && raw.virtual.id ? raw.virtual.id : DEFAULT_CONFIG.virtual.id,
 			name: typeof raw.virtual?.name === "string" && raw.virtual.name ? raw.virtual.name : DEFAULT_CONFIG.virtual.name,
@@ -695,14 +740,14 @@ function effectiveModelId(ctx: ExtensionContext): string {
 
 /** Physical ids in preference order: explicit chain, else the switch candidates. */
 function routeChain(): string[] {
-	const provider = config.virtual.provider;
-	const chain = config.virtual.chain.length ? config.virtual.chain : config.candidates;
-	return chain.map((id) => (id.startsWith(`${provider}/`) ? id.slice(provider.length + 1) : id)).filter((id) => id && id !== config.virtual.id);
+	const provider = virtualConfig.provider;
+	const chain = virtualConfig.chain.length ? virtualConfig.chain : config.candidates;
+	return chain.map((id) => (id.startsWith(`${provider}/`) ? id.slice(provider.length + 1) : id)).filter((id) => id && id !== virtualConfig.id);
 }
 
 function refreshRouteHealth(map: Map<string, ModelStat>, _now: number) {
 	routeHealth = routeChain().map((id, order) => {
-		const stat = map.get(`${config.virtual.provider}/${id}`);
+		const stat = map.get(`${virtualConfig.provider}/${id}`);
 		if (!stat) return { id, order };
 		const broken = isBroken(stat);
 		return { id, order, ttftMs: statVerdict(stat, 0).ttftMs, invalid: broken.invalid, failed: broken.failed };
@@ -713,7 +758,7 @@ function refreshRouteHealth(map: Map<string, ModelStat>, _now: number) {
 function routeCandidates(registry: { getAvailable?: () => Array<{ provider: string; id: string; contextWindow?: number; api?: string }> } | undefined): RouterCandidate[] {
 	const windows = new Map<string, number | undefined>();
 	for (const model of registry?.getAvailable?.() ?? []) {
-		if (model.provider !== config.virtual.provider || isVirtual(model)) continue;
+		if (model.provider !== virtualConfig.provider || isVirtual(model)) continue;
 		windows.set(model.id, typeof model.contextWindow === "number" ? model.contextWindow : undefined);
 	}
 	return routeHealth.map((candidate) => ({ ...candidate, contextWindow: windows.get(candidate.id) }));
@@ -728,7 +773,7 @@ function routeCandidates(registry: { getAvailable?: () => Array<{ provider: stri
  * the parent's verification. Registration is idempotent.
  */
 function registerAutoRouter(pi: ExtensionAPI) {
-	const cfg = config.virtual;
+	const cfg = virtualConfig;
 	if (!cfg.enabled || routeChain().length === 0) return;
 	pi.registerVirtualModel({
 		provider: cfg.provider,
@@ -1381,8 +1426,13 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	// The watchdog runs from a timer, outside every hook closure, so it needs the API too.
 	liveApi = pi;
 	// Load config immediately so pre-session events already see it; session_start reloads it.
+	// Synchronous first: the router must exist before the first request, not after the async
+	// config read resolves (a child's first request beat it and sent `ustc-auto` upstream).
+	virtualConfig = readVirtualConfigSync();
+	registerAutoRouter(pi);
 	void loadConfig().then((loaded) => {
 		config = loaded;
+		virtualConfig = loaded.virtual;
 		// Register before the first request: the session may already be selected on it.
 		registerAutoRouter(pi);
 		void recentStats(true).catch(() => undefined);
@@ -1560,6 +1610,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		stallFired = 0;
 		clearStall();
 		config = await loadConfig();
+		virtualConfig = config.virtual;
 		lastActivityAt = 0;
 		// Re-register from the freshly loaded config: a reload must not leave the previous
 		// chain (or a disabled virtual model) in the catalog.
@@ -1713,7 +1764,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	pi.registerCommand("speed-router", {
 		description: "Show the ustc-auto virtual model: its chain, per-model health, and what it would pick",
 		handler: async (_args, ctx) => {
-			const cfg = config.virtual;
+			const cfg = virtualConfig;
 			if (!cfg.enabled) {
 				ctx.ui.notify("[model-speed] virtual model is off (`virtual.enabled` in ~/.pi/agent/model-speed.json)", "info");
 				return;
@@ -1754,7 +1805,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	pi.registerCommand("speed-pick", {
 		description: "Print the model the health router would pick now — use it when dispatching a subagent",
 		handler: async (args, ctx) => {
-			const cfg = config.virtual;
+			const cfg = virtualConfig;
 			const registry = (ctx.modelRegistry ?? sessionCtx?.modelRegistry) as never;
 			const chain = routeChain();
 			if (chain.length === 0) {
