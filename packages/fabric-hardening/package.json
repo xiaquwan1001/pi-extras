@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric-hardening",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Idempotent, marker-guarded runtime patches for pi-fabric and pi-fold: survive a full temp dir, keep the real cause of a dead child, configurable recovery watchdog.",
   "type": "module",
   "license": "MIT",
