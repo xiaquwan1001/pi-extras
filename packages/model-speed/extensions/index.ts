@@ -746,6 +746,20 @@ function routeChain(): string[] {
 	return chain.map((id) => (id.startsWith(`${provider}/`) ? id.slice(provider.length + 1) : id)).filter((id) => id && id !== virtualConfig.id);
 }
 
+/**
+ * Physical models this session watched send no first token, until when.
+ *
+ * The virtual router's own failover vocabulary is "that model failed", and a stall is exactly
+ * that: nothing came back for `thresholds.stallMs`. Quarantining here is what lets the *next*
+ * route leave the hung model alone — see `switchToFaster` for why that is the only move the
+ * virtual model allows.
+ */
+const stalledUntil = new Map<string, number>();
+
+function quarantineStalled(id: string, ms: number): void {
+	if (ms > 0 && id) stalledUntil.set(id, Date.now() + ms);
+}
+
 function refreshRouteHealth(map: Map<string, ModelStat>, _now: number) {
 	routeHealth = routeChain().map((id, order) => {
 		const stat = map.get(`${virtualConfig.provider}/${id}`);
@@ -766,7 +780,17 @@ function routeCandidates(registry: { getAvailable?: () => Array<{ provider: stri
 	// the router still chooses by preference instead of falling through to "whatever answered
 	// last" (the first request after startup is exactly the one that must not be a coin flip).
 	const base = routeHealth.length > 0 ? routeHealth : routeChain().map((id, order) => ({ id, order }));
-	return base.map((candidate) => ({ ...candidate, contextWindow: windows.get(candidate.id) }));
+	const now = Date.now();
+	return base.map((candidate) => {
+		const until = stalledUntil.get(candidate.id) ?? 0;
+		return {
+			...candidate,
+			contextWindow: windows.get(candidate.id),
+			// A model that just sent no first token is a failure the stopwatch cannot see yet:
+			// mark it so the router steps off it on the very next request.
+			...(until > now ? { failed: true } : {}),
+		};
+	});
 }
 
 /**
@@ -1097,7 +1121,30 @@ async function switchToFaster(
 	if (!current) return skip("no current model");
 	// With the virtual model the router owns failover. A `setModel()` here would replace the
 	// stable selection with a physical id — exactly what pi-subagents reads as model drift.
-	if (isVirtual(current)) return skip("virtual router owns failover");
+	//
+	// Doing *nothing* deadlocked the stall path, though: the router only fails over on a
+	// `retry`, and pi's retry machinery fires on errors, not on aborts. A stalled request that
+	// nobody reroutes therefore ended at the second window with an abort of the whole turn
+	// (2026-11-25 14:39 → 14:42: two `stall` records, no `stall-parked`, "Operation aborted";
+	// the same session on a physical model parked and recovered at 13:09). So on a stall, do the
+	// move the virtual model *does* have: quarantine the physical model that produced no first
+	// token, so the next route leaves it alone, and report `true` so the watchdog parks instead
+	// of aborting. Any other trigger keeps the old behaviour — a marginally slow turn is not a
+	// reason to abandon a hand-picked physical model.
+	if (isVirtual(current)) {
+		if (reason !== "stall") return skip("virtual router owns failover");
+		const dead = streak.tail[0]?.model;
+		if (!dead) return skip("virtual router owns failover (no physical model to park)");
+		quarantineStalled(dead, virtualConfig.quarantineMs);
+		await appendLog({
+			kind: "switch-quarantine",
+			pid: process.pid,
+			trigger: "stall",
+			model: dead,
+			quarantineMs: virtualConfig.quarantineMs,
+		});
+		return true;
+	}
 	// Hard stop for pinned children: a switch here is read as model drift by the
 	// parent and ends the run (see PINNED_CHILD above). `/speed-auto on` cannot undo it.
 	// Checked before `config.auto`, because a pinned child *always* runs with auto=false and
