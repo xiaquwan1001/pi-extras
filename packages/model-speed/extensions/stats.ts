@@ -27,6 +27,10 @@ export type SpeedRecord = {
 	longCall?: boolean;
 	ok?: boolean;
 	status?: string;
+	/** A finished call that returned no content and no tool call. */
+	empty?: boolean;
+	/** A finished call whose body was special-token leakage or noise, not an answer. */
+	garbage?: boolean;
 };
 
 export type ModelStat = {
@@ -66,6 +70,14 @@ export type ModelStat = {
 	recentTokensPerSec?: number;
 	/** Failed samples inside the recent cohort — a fresh failure outranks an old success. */
 	recentErrors: number;
+	/** Samples whose *content* was empty or garbage (a HTTP 200 failure, invisible to `errors`). */
+	invalid: number;
+	/** Same, inside the recent cohort. */
+	recentInvalid: number;
+	/** End time of the newest invalid sample, ms. */
+	invalidLastAt?: number;
+	/** End time of the newest valid (non-empty, non-garbage) sample, ms. */
+	validLastAt?: number;
 };
 
 export type AggregateOptions = {
@@ -155,6 +167,9 @@ export function aggregate(records: SpeedRecord[], options: AggregateOptions): Ma
 		const small = timed.filter((r) => (r.promptTokens ?? 0) < options.largePromptTokens);
 		const large = timed.filter((r) => (r.promptTokens ?? 0) >= options.largePromptTokens);
 		const tps = list.map(recordTokensPerSec).filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+		const invalidList = list.filter((r) => Boolean(r.empty || r.garbage));
+		const validTimes = timed.filter((r) => !r.empty && !r.garbage).map(endOf);
+		const invalidTimes = invalidList.map(endOf);
 		const probeTimes = list.filter((r) => r.kind === "probe").map(endOf);
 		const allTimes = list.map(endOf);
 		const tokensOut = list.reduce((sum, r) => sum + (typeof r.tokensOut === "number" ? r.tokensOut : 0), 0);
@@ -166,6 +181,7 @@ export function aggregate(records: SpeedRecord[], options: AggregateOptions): Ma
 		const recentSmall = recentTimed.filter((r) => (r.promptTokens ?? 0) < options.largePromptTokens);
 		const recentLarge = recentTimed.filter((r) => (r.promptTokens ?? 0) >= options.largePromptTokens);
 		const recentTps = recentTimed.map(recordTokensPerSec).filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+		const recentInvalid = invalidList.filter((r) => endOf(r) >= recentCutoff).length;
 		stats.set(key, {
 			provider: first.provider ?? "?",
 			model: first.model ?? "?",
@@ -184,6 +200,10 @@ export function aggregate(records: SpeedRecord[], options: AggregateOptions): Ma
 			lastProbeAt: probeTimes.length ? Math.max(...probeTimes) : undefined,
 			recentN: recentTimed.length,
 			recentErrors: list.filter((r) => endOf(r) >= recentCutoff && Boolean(r.error)).length,
+			invalid: invalidList.length,
+			recentInvalid,
+			invalidLastAt: invalidTimes.length ? Math.max(...invalidTimes) : undefined,
+			validLastAt: validTimes.length ? Math.max(...validTimes) : undefined,
 			recentTtftMs: definedMedian(recentSmall.map((r) => r.ttftMs)),
 			recentTtftLargeMs: definedMedian(recentLarge.map((r) => r.ttftMs)),
 			recentTokensPerSec: recentTps.length ? definedMedian(recentTps) : undefined,
@@ -239,6 +259,12 @@ export function verdict(stat: ModelStat, options: VerdictOptions): Verdict {
 	const bucket: "small" | "large" = large ? "large" : "small";
 	const pick = (small?: number, big?: number) => (large ? (big ?? small) : (small ?? big));
 	const ageMs = stat.lastAt ? Math.max(0, options.now - stat.lastAt) : undefined;
+	// A fresh empty/garbage answer is a failure even though the call "succeeded": the stopwatch
+	// is fine, the content is not, so it must not read as "fast, pick me". This is the check the
+	// stopwatch could never make (2026-11-25: dsf2 returned 200 with DSML noise to four lanes).
+	if (isBroken(stat).invalid) {
+		return { ttftMs: undefined, tokensPerSec: stat.recentTokensPerSec ?? stat.tokensPerSec, source: "stale", ageMs, bucket };
+	}
 	const recentTtft = pick(stat.recentTtftMs, stat.recentTtftLargeMs);
 	if (stat.recentN > 0 && recentTtft !== undefined) {
 		return { ttftMs: recentTtft, tokensPerSec: stat.recentTokensPerSec ?? stat.tokensPerSec, source: "recent", ageMs, bucket };
@@ -255,6 +281,19 @@ export function verdict(stat: ModelStat, options: VerdictOptions): Verdict {
 	}
 	if (windowTtft !== undefined || ageMs !== undefined) return { ttftMs: undefined, tokensPerSec: stat.tokensPerSec, source: "stale", ageMs, bucket };
 	return { ttftMs: undefined, source: "none", ageMs, bucket };
+}
+
+/**
+ * What the *newest* evidence says about a model's content, independent of speed.
+ *
+ * `invalidLastAt >= validLastAt` is the whole rule: one good answer after a garbage streak
+ * clears the mark, so a model that recovered is usable again without a manual reset.
+ */
+export function isBroken(stat: ModelStat): { invalid: boolean; failed: boolean } {
+	return {
+		invalid: stat.recentInvalid > 0 && (stat.invalidLastAt ?? 0) >= (stat.validLastAt ?? 0),
+		failed: stat.recentErrors > 0,
+	};
 }
 
 /** Verdicts sorted fastest-first; unknown models last. */

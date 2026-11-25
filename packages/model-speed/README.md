@@ -78,6 +78,8 @@ Restart Pi (or `/reload`).
 | `/speed-probe` | Sample the stale pool models now (background); `/speed-probe --force` ignores freshness; `/speed-probe <model…>` samples exactly those; `--external` runs the legacy probe script |
 | `/speed-stats` | This session's TTFT/TPOT medians, the remembered switch budget, and the rolling recent window |
 | `/speed-auto on\|off` | Toggle failover for this session |
+| `/speed-router` | The `ustc-auto` virtual model: chain, per-model health, and the model it would pick now |
+| `/speed-pick` | Print the provider-qualified model the router would use now — use it when dispatching a subagent |
 
 ## Configuration
 
@@ -183,6 +185,24 @@ Ranking uses, in order: the **verdict** from the rotation window (recency cohort
 
 Recent measured data deliberately outranks an external probe file: a probe with a cold 2 k prompt can report 0.3 s while the same model serves this session in 6 s, and the rolling window is what users actually felt. Token speed travels with the ranking, so a model that answers quickly but generates at 9 tok/s is visibly unappealing in `/speed`.
 
+## The virtual model: one selection, a physical model per request
+
+A gateway can fail over on its own, but the client has to *stop switching* for that to be useful: pi-subagents verifies every assistant message against the launch candidate and fails the whole run with `model_verification_failed` when a child changed models mid-run (2026-11-24, run `e5a8e44a`: the review was delivered and the run was thrown away). The old answer was to pin children to one model; that is safe but leaves the child on a model the pool has already given up on.
+
+With `virtual.enabled`, the extension registers a **virtual model** (`custom.ustc-pool/ustc-auto`) whose `route()` picks the physical model per request:
+
+- the **selection** never changes, so the parent's verification, the prompt cache and the thinking signatures stay valid;
+- the chain (`ustc-dsf → ustc-dsf2 → ustc-glm → ustc-qwen`) is the preference order, and a later entry is promoted only on a **clear** win (`virtual.minGainRatio`, 2×) — the chain encodes capability, not just speed;
+- a `continuation` keeps the model that answered last; a `retry` steps off the failed model and parks it for `virtual.quarantineMs`;
+- the **256k model is never given a request that needs more** than it holds (live context usage when Pi has it, otherwise a character estimate, plus `virtual.headroomTokens`);
+- a model whose newest answer was **empty or special-token garbage** is not a target, however fast its TTFT was.
+
+That last rule is the one a stopwatch cannot express. deepseek-flash-2 answered HTTP 200 with `<｜DSML｜>…` bodies on 2026-11-25; four subagent lanes exited 0 with zero output while every latency field said "healthy, fast". Content is now classified on every real turn (`empty`, `garbage`, `chars` in the log) and on every synthetic sample, `stats` counts it (`invalid` / `recentInvalid`), and `verdict()` refuses to rank a model whose newest evidence is garbage. One good answer after the streak clears it — no manual reset.
+
+**Children.** Foreground pi-subagents children do not load ambient extensions, and virtual models are not part of provider registration, so a foreground child cannot resolve `ustc-auto` (the gateway answers `400 Invalid model name`). Background (`async: true`) children do load ambient extensions, so they can be launched on `custom.ustc-pool/ustc-auto` (pi-subagents documents ambient discovery for background children; verify on the first lane in a new environment). For that reason the shipped defaults are: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `/speed-pick` instead of guessing, or dispatch a background lane on the virtual one.
+
+`PI_MODEL_SPEED_SAMPLING_ALLOW_CHILD=1` re-enables pool sampling inside a pinned child (off by default: a worker on one model only adds gateway load beside the parent's samples).
+
 ## Diagnosing "why didn't it switch?"
 
 `speed-log.jsonl` (in `~/.cache/pi-model-speed/`) carries everything needed after the fact:
@@ -209,4 +229,5 @@ node --test packages/model-speed/tests/*.test.mjs   # failover decision, verdict
 - Synthetic samples cost tokens: ~2 k prompt + up to 128 output per model per interval, capped by `sampling.maxModels`. Set `sampling.enabled: false` (or `PI_MODEL_SPEED_SAMPLING=0`) to keep only real-turn measurements.
 - If you used an external cron/systemd probe for freshness, disable it: the extension now samples while Pi is open, and the probe file only remains as a fallback source.
 - If your provider names the deployment that answered in a header (`x-litellm-model-name` / `x-litellm-model-id`), real samples record it as `served`, which is often more useful than the requested id.
-- The extension never edits model configuration; it only calls `setModel` on the live session.
+- The extension never edits model configuration. It calls `setModel` on the live session only when auto failover moves a session off a slow model, and never when the selection is the virtual model or a pinned child (the router owns that decision).
+- `virtual.minGainRatio` (default 2) is the whole "is it worth jumping the chain" policy: lower promotes faster, higher keeps the preferred model longer.

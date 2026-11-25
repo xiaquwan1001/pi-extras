@@ -108,7 +108,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { sampleModels, type ProbeOutcome, type SamplerModel, type StreamRegistry } from "./sampler.ts";
+import { classifyOutput, replyShape, sampleModels, type ProbeOutcome, type SamplerModel, type StreamRegistry } from "./sampler.ts";
 import {
 	ephemeralSessionKey,
 	inheritedSessionKey,
@@ -120,7 +120,18 @@ import {
 	type SessionSwitchMemory,
 	type SwitchStateFile,
 } from "./sessions.ts";
-import { aggregate, definedMedian, median, recentRecords, sortedVerdicts, type ModelStat, type Verdict, verdict } from "./stats.ts";
+import { chooseRoute, estimateNeedTokens, type RouterCandidate, type RouterState } from "./router.ts";
+import {
+	aggregate,
+	definedMedian,
+	isBroken,
+	median,
+	recentRecords,
+	sortedVerdicts,
+	type ModelStat,
+	type Verdict,
+	verdict,
+} from "./stats.ts";
 
 /**
  * A child session is launched on the model its parent named, and the parent treats any
@@ -206,6 +217,30 @@ type StatsConfig = {
 	/** No measurement newer than this means "unknown", never "fast". */
 	staleMs: number;
 };
+/**
+ * The virtual model: one selectable id that picks a physical model per request.
+ *
+ * A rule decided mid-run by `setModel()` is what pi-subagents reports as
+ * `model_verification_failed`; a virtual model keeps the selection constant, so routing is
+ * invisible to the parent, the run survives, and the session no longer has to "be" a model.
+ */
+type VirtualConfig = {
+	enabled: boolean;
+	provider: string;
+	id: string;
+	name: string;
+	/** Physical model ids in preference order; empty = `candidates`. */
+	chain: string[];
+	thinkingLevels: string[];
+	contextWindow?: number;
+	maxTokens?: number;
+	/** Headroom added to the estimated conversation size for the context guard. */
+	headroomTokens: number;
+	/** How long a model the router stepped off stays out of the rotation. */
+	quarantineMs: number;
+	/** How much faster a later chain entry must be to be promoted over an earlier healthy one. */
+	minGainRatio: number;
+};
 type Config = {
 	auto: boolean;
 	providers: string[];
@@ -222,6 +257,7 @@ type Config = {
 	probe: { command?: string[]; file?: string; maxAgeMs: number };
 	sampling: Sampling;
 	stats: StatsConfig;
+	virtual: VirtualConfig;
 };
 
 const num = (value: unknown, fallback: number) => {
@@ -264,6 +300,17 @@ const DEFAULT_CONFIG: Config = {
 		models: [],
 	},
 	stats: { windowMs: 21_600_000, recentMs: 1_800_000, staleMs: 3_600_000 },
+	virtual: {
+		enabled: false,
+		provider: "custom.ustc-pool",
+		id: "ustc-auto",
+		name: "ustc-auto (routes by health history)",
+		chain: [],
+		thinkingLevels: ["minimal", "low", "medium", "high", "xhigh", "max"],
+		headroomTokens: 32_000,
+		quarantineMs: 900_000,
+		minGainRatio: 2,
+	},
 };
 
 type Sample = {
@@ -280,6 +327,12 @@ type Sample = {
 	error?: string;
 	/** The call took absurdly long (hung / upstream meltdown); kept, but never treated as a normal turn. */
 	longCall?: boolean;
+	/** The turn finished with no content and no tool call. */
+	empty?: boolean;
+	/** The turn's content was special-token leakage or noise, not an answer. */
+	garbage?: boolean;
+	/** Non-space characters of the reply: proves the content was actually inspected. */
+	chars?: number;
 };
 
 type ProbeEntry = {
@@ -400,9 +453,13 @@ async function loadConfig(): Promise<Config> {
 			maxAgeMs: num(process.env.PI_MODEL_SPEED_PROBE_MAX_AGE_MS, num(raw.probe?.maxAgeMs, DEFAULT_CONFIG.probe.maxAgeMs)),
 		},
 		sampling: {
-			// Sampling stays on in pinned children (their measurements are still real); only a
-			// global PI_MODEL_SPEED=0 or an explicit false disables it.
-			enabled: process.env.PI_MODEL_SPEED !== "0" && raw.sampling?.enabled !== false,
+			// Sampling is off in pinned children: a worker on one pinned model adds gateway load
+			// and spend beside the parent's samples and merges nothing new. Opt back in with
+			// PI_MODEL_SPEED_SAMPLING_ALLOW_CHILD=1 while debugging a child.
+			enabled:
+				process.env.PI_MODEL_SPEED !== "0" &&
+				raw.sampling?.enabled !== false &&
+				!(PINNED_CHILD && !AUTO_IN_CHILD && process.env.PI_MODEL_SPEED_SAMPLING_ALLOW_CHILD !== "1"),
 			intervalMs: num(
 				process.env.PI_MODEL_SPEED_SAMPLING_INTERVAL_MS,
 				num(raw.sampling?.intervalMs, DEFAULT_CONFIG.sampling.intervalMs),
@@ -421,6 +478,21 @@ async function loadConfig(): Promise<Config> {
 			windowMs: num(process.env.PI_MODEL_SPEED_STATS_WINDOW_MS, num(raw.stats?.windowMs, DEFAULT_CONFIG.stats.windowMs)),
 			recentMs,
 			staleMs,
+		},
+		virtual: {
+			enabled: disabled ? false : raw.virtual?.enabled === true,
+			provider: typeof raw.virtual?.provider === "string" && raw.virtual.provider ? raw.virtual.provider : DEFAULT_CONFIG.virtual.provider,
+			id: typeof raw.virtual?.id === "string" && raw.virtual.id ? raw.virtual.id : DEFAULT_CONFIG.virtual.id,
+			name: typeof raw.virtual?.name === "string" && raw.virtual.name ? raw.virtual.name : DEFAULT_CONFIG.virtual.name,
+			chain: Array.isArray(raw.virtual?.chain) ? raw.virtual.chain.filter((v: unknown) => typeof v === "string") : [],
+			thinkingLevels: Array.isArray(raw.virtual?.thinkingLevels) && raw.virtual.thinkingLevels.length
+				? raw.virtual.thinkingLevels.filter((v: unknown) => typeof v === "string")
+				: [...DEFAULT_CONFIG.virtual.thinkingLevels],
+			contextWindow: typeof raw.virtual?.contextWindow === "number" ? raw.virtual.contextWindow : undefined,
+			maxTokens: typeof raw.virtual?.maxTokens === "number" ? raw.virtual.maxTokens : undefined,
+			headroomTokens: Math.max(0, num(raw.virtual?.headroomTokens, DEFAULT_CONFIG.virtual.headroomTokens)),
+			quarantineMs: Math.max(0, num(raw.virtual?.quarantineMs, DEFAULT_CONFIG.virtual.quarantineMs)),
+			minGainRatio: Math.max(1, num(raw.virtual?.minGainRatio, DEFAULT_CONFIG.virtual.minGainRatio)),
 		},
 	};
 }
@@ -570,6 +642,7 @@ async function recentStats(force = false): Promise<Map<string, ModelStat>> {
 		const records = recentRecords(lines, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens });
 		const map = aggregate(records, { now, windowMs, largePromptTokens: config.thresholds.largePromptTokens, recentMs });
 		statsCache = { at: now, windowMs, recentMs, map };
+		refreshRouteHealth(map, now);
 		return map;
 	} catch {
 		return new Map<string, ModelStat>();
@@ -591,6 +664,128 @@ function statVerdict(stat: ModelStat, needTokens: number): Verdict {
 	});
 }
 
+// ---- virtual model: one selection, a physical model per request ----------
+/** API id pi gives a virtual catalog entry. It never reaches a provider. */
+const VIRTUAL_API = "pi-virtual";
+const isVirtual = (model: { api?: string } | undefined): boolean => model?.api === VIRTUAL_API;
+
+/**
+ * Health snapshot the router reads.
+ *
+ * `route()` runs synchronously before every request, so it cannot read the log or rank the
+ * pool itself. The snapshot is rebuilt wherever the rolling window is rebuilt anyway
+ * (startup, sampling, turn end) and is pure data afterwards.
+ */
+let routeHealth: RouterCandidate[] = [];
+/**
+ * Physical model the router chose for the request in flight.
+ *
+ * With a virtual selection, `ctx.model` is the virtual entry and the assistant message names the
+ * physical model — so timing samples, the status line and the streak logic would otherwise be
+ * keyed by `ustc-auto` and the per-model history would go dark (seen in the 2026-11-25 smoke:
+ * a `ustc-auto` sample with `served: openai/deepseek-flash`). `route()` runs right before each
+ * request, so this is the physical model that request is on.
+ */
+let lastRoutedModel: { provider: string; id: string } | undefined;
+
+function effectiveModelId(ctx: ExtensionContext): string {
+	if (!isVirtual(ctx.model) || !lastRoutedModel) return ctx.model?.id ?? "";
+	return lastRoutedModel.id;
+}
+
+/** Physical ids in preference order: explicit chain, else the switch candidates. */
+function routeChain(): string[] {
+	const provider = config.virtual.provider;
+	const chain = config.virtual.chain.length ? config.virtual.chain : config.candidates;
+	return chain.map((id) => (id.startsWith(`${provider}/`) ? id.slice(provider.length + 1) : id)).filter((id) => id && id !== config.virtual.id);
+}
+
+function refreshRouteHealth(map: Map<string, ModelStat>, _now: number) {
+	routeHealth = routeChain().map((id, order) => {
+		const stat = map.get(`${config.virtual.provider}/${id}`);
+		if (!stat) return { id, order };
+		const broken = isBroken(stat);
+		return { id, order, ttftMs: statVerdict(stat, 0).ttftMs, invalid: broken.invalid, failed: broken.failed };
+	});
+}
+
+/** Candidates with their catalog context windows, which is what excludes the 256k model. */
+function routeCandidates(registry: { getAvailable?: () => Array<{ provider: string; id: string; contextWindow?: number; api?: string }> } | undefined): RouterCandidate[] {
+	const windows = new Map<string, number | undefined>();
+	for (const model of registry?.getAvailable?.() ?? []) {
+		if (model.provider !== config.virtual.provider || isVirtual(model)) continue;
+		windows.set(model.id, typeof model.contextWindow === "number" ? model.contextWindow : undefined);
+	}
+	return routeHealth.map((candidate) => ({ ...candidate, contextWindow: windows.get(candidate.id) }));
+}
+
+/**
+ * Register the virtual model pi-subagents and the session can select.
+ *
+ * A rule decided by `setModel()` mid-run is reported by pi-subagents as
+ * `model_verification_failed` and kills the run; a virtual model keeps the *selection*
+ * constant while the physical model changes, so the same gateway-level failover survives
+ * the parent's verification. Registration is idempotent.
+ */
+function registerAutoRouter(pi: ExtensionAPI) {
+	const cfg = config.virtual;
+	if (!cfg.enabled || routeChain().length === 0) return;
+	pi.registerVirtualModel({
+		provider: cfg.provider,
+		id: cfg.id,
+		name: cfg.name,
+		thinkingLevels: cfg.thinkingLevels as never,
+		...(cfg.contextWindow ? { contextWindow: cfg.contextWindow } : {}),
+		...(cfg.maxTokens ? { maxTokens: cfg.maxTokens } : {}),
+		route: (request, ctx) => {
+			const registry = ctx.modelRegistry as unknown as {
+				getAvailable?: () => Array<{ provider: string; id: string; contextWindow?: number; api?: string }>;
+				find?: (provider: string, id: string) => unknown;
+			};
+			const physical = (id: string | undefined) => {
+				if (!id) return undefined;
+				const direct = registry?.find?.(cfg.provider, id) as { provider: string; id: string } | undefined;
+				if (direct) return direct;
+				return registry
+					?.getAvailable?.()
+					.find((model) => model.provider === cfg.provider && model.id === id && !isVirtual(model)) as unknown as
+					| { provider: string; id: string }
+					| undefined;
+			};
+			// Live usage is authoritative when pi has it (it reflects compaction and the real
+			// tokenizer); the character estimate only fills the gap before the first response or
+			// in modes without usage. Taking the maximum keeps a CJK-heavy conversation from
+			// being under-counted into the 256k model.
+			const live = Number(ctx.getContextUsage?.()?.tokens ?? 0);
+			const needTokens = Math.max(live > 0 ? live : 0, estimateNeedTokens(request.messages, 0)) + cfg.headroomTokens;
+			const state = (request.state ?? undefined) as RouterState | undefined;
+			const choice = chooseRoute({
+				candidates: routeCandidates(registry),
+				chain: routeChain(),
+				needTokens,
+				reason: request.reason,
+				previousId: request.previous?.model?.id,
+				failedId: request.failed?.model?.id,
+				state,
+				now: Date.now(),
+				quarantineMs: cfg.quarantineMs,
+				minGainRatio: cfg.minGainRatio,
+			});
+			// The chain is the contract; if the chosen id is missing from the catalog (a model
+			// removed from the gateway between samples), fall back along the chain instead of
+			// failing the turn.
+			for (const id of [choice?.modelId, request.previous?.model?.id, routeChain()[0]]) {
+				const model = physical(id);
+				if (model) {
+					lastRoutedModel = { provider: cfg.provider, id: model.id };
+					return { model: model as never, thinkingLevel: request.thinkingLevel, state: choice?.state };
+				}
+			}
+			throw new Error(`[model-speed] ${cfg.id}: none of ${routeChain().join(", ")} is in the catalog`);
+		},
+	});
+}
+
 /** Compact one-line view of a model inside the rolling window. */
 function fmtStat(stat: ModelStat): string {
 	const current = statVerdict(stat, 0);
@@ -599,6 +794,9 @@ function fmtStat(stat: ModelStat): string {
 	if ((current.tokensPerSec ?? stat.tokensPerSec) !== undefined) parts.push(`${Math.round((current.tokensPerSec ?? stat.tokensPerSec)!)} tok/s`);
 	parts.push(`n=${stat.n}${stat.probeN ? ` (${stat.probeN} probe)` : ""}`);
 	if (stat.errors) parts.push(`err=${stat.errors}`);
+	// "empty/garbage" is a failure the stopwatch cannot see, so it must be visible in /speed.
+	if (stat.invalid) parts.push(`bad-content=${stat.invalid}`);
+	if (isBroken(stat).invalid) parts.push("unusable");
 	if (current.source === "stale") parts.push(`stale ${fmtAgeSpan(current.ageMs)}`);
 	else parts.push(`${current.source === "recent" ? "" : "window "}${fmtAge(stat.lastProbeAt ?? stat.lastAt)}`);
 	return parts.join(" · ");
@@ -706,7 +904,7 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 	const candidates: Candidate[] = [];
 	const excluded: ExcludedCandidate[] = [];
 	for (const model of ctx.modelRegistry.getAvailable()) {
-		if (model.provider !== provider || !allowed(model.id)) continue;
+		if (model.provider !== provider || isVirtual(model) || !allowed(model.id)) continue;
 		const contextWindow = typeof model.contextWindow === "number" ? model.contextWindow : undefined;
 		// Never hide the model you are already on: the session is its own problem then.
 		if (model.id !== currentId && needTokens > 0 && contextWindow !== undefined && contextWindow < needTokens) {
@@ -847,11 +1045,16 @@ async function switchToFaster(
 		return false;
 	};
 	if (!current) return skip("no current model");
-	if (!config.auto) return skip("auto off");
-	if (switchCount >= config.maxSwitchesPerSession) return skip(`switch budget spent (${switchCount}/${config.maxSwitchesPerSession})`);
+	// With the virtual model the router owns failover. A `setModel()` here would replace the
+	// stable selection with a physical id — exactly what pi-subagents reads as model drift.
+	if (isVirtual(current)) return skip("virtual router owns failover");
 	// Hard stop for pinned children: a switch here is read as model drift by the
 	// parent and ends the run (see PINNED_CHILD above). `/speed-auto on` cannot undo it.
+	// Checked before `config.auto`, because a pinned child *always* runs with auto=false and
+	// logging that as "auto off" made a parent's pinning look like a user decision (2026-11-25).
 	if (PINNED_CHILD && !AUTO_IN_CHILD) return skip(SUBAGENT_CHILD ? "subagent child" : "fabric child");
+	if (!config.auto) return skip("auto off");
+	if (switchCount >= config.maxSwitchesPerSession) return skip(`switch budget spent (${switchCount}/${config.maxSwitchesPerSession})`);
 	// Per *session* pacing: one session's switch must not freeze every other session,
 	// which is what the shared lastSwitchAt file used to do.
 	if (Date.now() - lastSwitchAt < config.switchCooldownMs) return skip("switch cooldown");
@@ -1053,7 +1256,7 @@ async function staleSamplerTargets(ctx: ExtensionContext): Promise<SamplerModel[
 		config.sampling.models.includes(`${model.provider}/${model.id}`);
 	return ctx.modelRegistry
 		.getAvailable()
-		.filter((model) => providers.has(model.provider) && matches(model))
+		.filter((model) => providers.has(model.provider) && matches(model) && !isVirtual(model))
 		// A model that cannot hold the sample prompt would only record a context error.
 		.filter((model) => !model.contextWindow || model.contextWindow >= config.sampling.promptTokens + 2048)
 		.map((model) => ({ model, lastAt: stats.get(`${model.provider}/${model.id}`)?.lastProbeAt }))
@@ -1180,6 +1383,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	// Load config immediately so pre-session events already see it; session_start reloads it.
 	void loadConfig().then((loaded) => {
 		config = loaded;
+		// Register before the first request: the session may already be selected on it.
+		registerAutoRouter(pi);
+		void recentStats(true).catch(() => undefined);
 	});
 
 	// ---- sampling ---------------------------------------------------------
@@ -1190,7 +1396,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		lastActivityAt = Date.now();
 		// A real turn beats a synthetic sample: the gateway is one queue and the user is waiting.
 		samplerAbort?.abort();
-		pending.push({ model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", startedAt: Date.now() });
+		pending.push({ model: effectiveModelId(ctx), provider: ctx.model?.provider ?? "", startedAt: Date.now() });
 		if (pending.length > 8) pending.shift();
 		// Arm the stall watchdog: if no token arrives, `turn_end` never fires and nothing else
 		// in this extension gets a chance to act on a hung gateway.
@@ -1253,6 +1459,16 @@ export default function modelSpeed(pi: ExtensionAPI) {
 			}
 		}
 		if (message?.stopReason === "error" || message?.errorMessage) sample.error = sample.error ?? message?.errorMessage ?? "error";
+		// Content sanity of a *real* turn: a 200 with an empty or special-token body is the
+		// failure a stopwatch never sees (2026-11-25, four subagent lanes exited 0 with nothing).
+		// An aborted or errored turn is not evidence about the model, so it is skipped.
+		if (!sample.error && message?.stopReason !== "aborted") {
+			const shape = replyShape(message);
+			const verdictShape = classifyOutput(shape.text, shape.toolCalls);
+			sample.chars = verdictShape.chars;
+			if (verdictShape.empty) sample.empty = true;
+			if (verdictShape.garbage) sample.garbage = true;
+		}
 		samples.push(sample);
 		if (samples.length > 50) samples = samples.slice(-50);
 		await appendLog({ kind: "sample", pid: process.pid, ...sample });
@@ -1268,7 +1484,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		// Status line = this model's own recent TTFT, no id: the footer already names the
 		// model, so repeating it was duplication. `⚠` means slower than the applicable
 		// slow threshold for the prompt size seen most recently.
-		const mine = samples.filter((s) => s.model === current.id && typeof s.ttftMs === "number").slice(-5);
+		const mine = samples.filter((s) => s.model === effectiveModelId(ctx) && typeof s.ttftMs === "number").slice(-5);
 		const mineMedian = definedMedian(mine.map((s) => s.ttftMs));
 		if (mineMedian !== undefined) {
 			const lastPrompt = mine[mine.length - 1]?.promptTokens ?? 0;
@@ -1345,6 +1561,9 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		clearStall();
 		config = await loadConfig();
 		lastActivityAt = 0;
+		// Re-register from the freshly loaded config: a reload must not leave the previous
+		// chain (or a disabled virtual model) in the catalog.
+		registerAutoRouter(pi);
 
 		// Reload, resume and fork continue an existing conversation. Restoring its switch
 		// memory is the difference between "this session already used 2 of its 3 switches and
@@ -1488,6 +1707,79 @@ export default function modelSpeed(pi: ExtensionAPI) {
 			// `/speed` is now history-first: refresh in the background instead of blocking the TUI
 			// on a synchronous probe.
 			void maybeSample(ctx, { why: "speed" }).catch(() => undefined);
+		},
+	});
+
+	pi.registerCommand("speed-router", {
+		description: "Show the ustc-auto virtual model: its chain, per-model health, and what it would pick",
+		handler: async (_args, ctx) => {
+			const cfg = config.virtual;
+			if (!cfg.enabled) {
+				ctx.ui.notify("[model-speed] virtual model is off (`virtual.enabled` in ~/.pi/agent/model-speed.json)", "info");
+				return;
+			}
+			const stats = await recentStats();
+			const needTokens = estimateNeedTokens([], cfg.headroomTokens);
+			const registry = (sessionCtx?.modelRegistry ?? liveCtx?.modelRegistry) as never;
+			const lines = routeCandidates(registry).map((candidate) => {
+				const stat = stats.get(`${cfg.provider}/${candidate.id}`);
+				const broken = isBroken(stat ?? ({ recentInvalid: 0, recentErrors: 0 } as unknown as ModelStat));
+				const tags = [
+					stat ? fmtMs(statVerdict(stat, needTokens).ttftMs) : "unmeasured",
+					candidate.contextWindow ? `${Math.round(candidate.contextWindow / 1000)}k` : "?ctx",
+					broken.invalid ? "❌ bad content" : "",
+					broken.failed ? "❌ failed" : "",
+				].filter(Boolean);
+				return `${candidate.id}: ${tags.join(" ")}`;
+			});
+			const chosen = await Promise.resolve(
+				chooseRoute({
+					candidates: routeCandidates(registry),
+					chain: routeChain(),
+					needTokens,
+					reason: "user",
+					previousId: ctx.model?.provider === cfg.provider ? ctx.model.id : undefined,
+					now: Date.now(),
+					quarantineMs: cfg.quarantineMs,
+				}),
+			);
+			const selected = ctx.model?.id === cfg.id ? " (selected)" : "";
+			ctx.ui.notify(
+				`[model-speed] ${cfg.provider}/${cfg.id}${selected} → ${chosen?.modelId ?? "none"}: ${lines.join(" | ")}`,
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("speed-pick", {
+		description: "Print the model the health router would pick now — use it when dispatching a subagent",
+		handler: async (args, ctx) => {
+			const cfg = config.virtual;
+			const registry = (ctx.modelRegistry ?? sessionCtx?.modelRegistry) as never;
+			const chain = routeChain();
+			if (chain.length === 0) {
+				ctx.ui.notify("[model-speed] no chain configured (virtual.chain or candidates in model-speed.json)", "warning");
+				return;
+			}
+			const needTokens = Math.max(Number(ctx.getContextUsage?.()?.tokens ?? 0), estimateNeedTokens([], 0)) + cfg.headroomTokens;
+			const choice = chooseRoute({
+				candidates: routeCandidates(registry),
+				chain,
+				needTokens,
+				reason: args.trim() === "retry" ? "retry" : "user",
+				previousId: undefined,
+				now: Date.now(),
+				quarantineMs: cfg.quarantineMs,
+			});
+			const id = choice?.modelId;
+			if (!id) {
+				ctx.ui.notify("[model-speed] the router has no candidate; run /speed first", "warning");
+				return;
+			}
+			// Full provider-qualified id: a child launched with a bare id is what pi-subagents
+			// reports as `model_verification_failed` (bare vs `provider/id` comparison).
+			const fullId = `${cfg.provider}/${id}`;
+			ctx.ui.notify(`[model-speed] dispatch model: ${fullId} (chain: ${chain.join(" → ")}, need ~${Math.round(needTokens / 1000)}k ctx)`, "info");
 		},
 	});
 

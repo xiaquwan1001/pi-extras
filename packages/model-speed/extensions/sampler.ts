@@ -46,6 +46,12 @@ export type ProbeOutcome = {
 	startedAt: number;
 	endedAt: number;
 	error?: string;
+	/** Non-space characters of the reply. */
+	chars?: number;
+	/** The call "succeeded" with no content and no tool call. */
+	empty?: boolean;
+	/** The reply was special-token leakage or noise, not an answer. */
+	garbage?: boolean;
 };
 
 export type SampleOptions = {
@@ -74,6 +80,54 @@ const isPayload = (event: any): boolean =>
 	event?.type === "toolcall_delta" ||
 	event?.type === "toolcall_start";
 
+/**
+ * Literal markers of a gateway that leaked special tokens instead of an answer.
+ *
+ * deepseek-flash-2 behind the campus gateway returns HTTP 200 with bodies like
+ * `<｜DSML｜tool_calls>...` (2026-11-25): four pi-subagents lanes exited 0 with zero output,
+ * because a 200 with garbage looks like success to every layer below the content.
+ */
+const GARBAGE_MARKERS = ["<｜", "｜>", "＜｜", "\uFF5C", "DSML"];
+
+/**
+ * Was this reply an answer, an empty "success", or noise?
+ *
+ * Deliberately means *content sanity*, not quality: a short answer, a terse JSON blob or a
+ * single tool call are all valid, and treating them as suspicious would ban healthy models.
+ */
+export function classifyOutput(text: string, toolCalls = 0): { chars: number; empty: boolean; garbage: boolean } {
+	const trimmed = text.replace(/\s+/g, " ").trim();
+	const chars = trimmed.length;
+	// A tool-only turn legitimately has no text: only an empty *and* tool-less reply is empty.
+	if (chars === 0) return { chars, empty: toolCalls === 0, garbage: false };
+	// U+FFFD is the decoder's own admission that the bytes were not text.
+	if (trimmed.includes("\uFFFD")) return { chars, empty: false, garbage: true };
+	if (GARBAGE_MARKERS.some((marker) => trimmed.includes(marker))) return { chars, empty: false, garbage: true };
+	// A long "reply" that is mostly neither letters/digits nor punctuation is a corrupted stream,
+	// not a short answer. The length floor keeps a one-emoji answer from being called garbage.
+	if (chars >= 8) {
+		const words = (trimmed.match(/[\p{L}\p{N}\p{P}]/gu) ?? []).length;
+		if (words / chars < 0.5) return { chars, empty: false, garbage: true };
+	}
+	return { chars, empty: false, garbage: false };
+}
+
+/** Text and tool-call count of a finished assistant message, whoever built it. */
+export function replyShape(message: any): { text: string; toolCalls: number } {
+	const content = message?.content;
+	if (typeof content === "string") return { text: content, toolCalls: 0 };
+	let text = "";
+	let toolCalls = 0;
+	if (!Array.isArray(content)) return { text, toolCalls };
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		const type = (block as any).type;
+		if (type === "text" && typeof (block as any).text === "string") text += (block as any).text;
+		else if (type === "toolCall" || type === "tool_call" || type === "toolcall") toolCalls += 1;
+	}
+	return { text, toolCalls };
+}
+
 /** One timed synthetic call. Never throws: a failure is a recorded outcome. */
 export async function sampleModel(
 	registry: StreamRegistry,
@@ -95,6 +149,10 @@ export async function sampleModel(
 	options.signal?.addEventListener("abort", onOuterAbort);
 	const tag = `${Math.random().toString(16).slice(2, 18)}`;
 	let firstAt: number | undefined;
+	// The reply is classified, not just timed: a 200 with an empty or special-token body is
+	// the failure mode a stopwatch cannot see.
+	let streamedText = "";
+	let streamedToolCalls = 0;
 	let result: any;
 	let error: string | undefined;
 	try {
@@ -113,6 +171,8 @@ export async function sampleModel(
 		);
 		for await (const event of stream) {
 			if (firstAt === undefined && isPayload(event)) firstAt = Date.now();
+			if (event?.type === "text_delta" && typeof event.delta === "string") streamedText += event.delta;
+			else if (event?.type === "toolcall_start") streamedToolCalls += 1;
 		}
 		result = await stream.result();
 	} catch (cause) {
@@ -148,6 +208,9 @@ export async function sampleModel(
 			error: error ?? "no first token",
 		};
 	}
+	// Prefer the finished message (authoritative, includes tool calls); fall back to the deltas.
+	const shape = replyShape(result);
+	const verdict = classifyOutput(shape.text || streamedText, shape.toolCalls || streamedToolCalls);
 	return {
 		...base,
 		ok: true,
@@ -155,6 +218,7 @@ export async function sampleModel(
 		tpotMs,
 		tokensOut,
 		tokensPerSec: genMs && tokensOut ? Math.round((tokensOut * 1000) / genMs) : undefined,
+		...verdict,
 	};
 }
 

@@ -162,3 +162,42 @@ test("sorted verdicts put fresh fast models first and unknown models last", () =
 	const staleOrder = sortedVerdicts(stats, { now, largePromptTokens: 30_000, staleMs: 60_000 }).map((entry) => entry.stat.model);
 	assert.equal(staleOrder.at(-1), "ancient", "a stale model is unknown, not fast");
 });
+
+// 2026-11-25: deepseek-flash-2 answered HTTP 200 with empty/DSML bodies. Every field the
+// window had (TTFT, TPOT, errors) called that a healthy fast model, and four subagent lanes
+// exited 0 with nothing. Content sanity has to be its own signal.
+test("empty and garbage replies are counted as invalid, not as speed", () => {
+	const lines = [
+		line(sample({ endedAt: now - 60_000, ttftMs: 300 })),
+		line(sample({ endedAt: now - 30_000, ttftMs: 320, empty: true })),
+		line(sample({ endedAt: now - 20_000, ttftMs: 310, garbage: true })),
+	];
+	const stat = aggregate(recentRecords(lines, opts), { ...opts, recentMs: 1_800_000 }).get("custom.ustc-pool/ustc-dsf2");
+	assert.equal(stat.invalid, 2);
+	assert.equal(stat.recentInvalid, 2);
+	assert.equal(stat.errors, 0, "a 200 with garbage is not an HTTP error");
+	assert.equal(stat.invalidLastAt, now - 20_000);
+	assert.equal(stat.validLastAt, now - 60_000);
+});
+
+test("a model whose newest answer was garbage is not a target, however fast it looks", () => {
+	const lines = [
+		line(sample({ endedAt: now - 60_000, ttftMs: 300 })),
+		line(sample({ endedAt: now - 20_000, ttftMs: 310, garbage: true })),
+	];
+	const stat = aggregate(recentRecords(lines, opts), { ...opts, recentMs: 1_800_000 }).get("custom.ustc-pool/ustc-dsf2");
+	const v = verdict(stat, { now, largePromptTokens: 30_000 });
+	assert.equal(v.ttftMs, undefined);
+	assert.equal(v.source, "stale");
+});
+
+test("one good answer after a garbage streak makes the model usable again", () => {
+	const lines = [
+		line(sample({ endedAt: now - 60_000, ttftMs: 300, garbage: true })),
+		line(sample({ endedAt: now - 20_000, ttftMs: 310 })),
+	];
+	const stat = aggregate(recentRecords(lines, opts), { ...opts, recentMs: 1_800_000 }).get("custom.ustc-pool/ustc-dsf2");
+	const v = verdict(stat, { now, largePromptTokens: 30_000 });
+	assert.equal(v.source, "recent");
+	assert.equal(v.ttftMs, 305, "median of the two valid answers");
+});
