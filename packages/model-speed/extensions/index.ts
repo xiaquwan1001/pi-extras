@@ -303,9 +303,10 @@ const DEFAULT_CONFIG: Config = {
 	stats: { windowMs: 21_600_000, recentMs: 1_800_000, staleMs: 3_600_000 },
 	virtual: {
 		enabled: false,
-		provider: "custom.ustc-pool",
-		id: "ustc-auto",
-		name: "ustc-auto (routes by health history)",
+		// Placeholder defaults: configure your own provider/id in ~/.pi/agent/model-speed.json (see README).
+		provider: "my-gateway",
+		id: "auto",
+		name: "auto (health-routed)",
 		chain: [],
 		thinkingLevels: ["minimal", "low", "medium", "high", "xhigh", "max"],
 		headroomTokens: 32_000,
@@ -761,7 +762,11 @@ function routeCandidates(registry: { getAvailable?: () => Array<{ provider: stri
 		if (model.provider !== virtualConfig.provider || isVirtual(model)) continue;
 		windows.set(model.id, typeof model.contextWindow === "number" ? model.contextWindow : undefined);
 	}
-	return routeHealth.map((candidate) => ({ ...candidate, contextWindow: windows.get(candidate.id) }));
+	// Before the first stats read lands, the health snapshot is empty — synthesize the chain so
+	// the router still chooses by preference instead of falling through to "whatever answered
+	// last" (the first request after startup is exactly the one that must not be a coin flip).
+	const base = routeHealth.length > 0 ? routeHealth : routeChain().map((id, order) => ({ id, order }));
+	return base.map((candidate) => ({ ...candidate, contextWindow: windows.get(candidate.id) }));
 }
 
 /**

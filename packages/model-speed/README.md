@@ -17,7 +17,7 @@ Two details that make the numbers trustworthy rather than decorative:
 
 Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl` (every line carries the `session` it belongs to), and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed-stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
 
-**A six-hour median is not a verdict.** With sparse sampling — long idle gaps between sessions — a fresh 10.2 s measurement used to lose against four 1.3 s measurements from hours earlier, so the model that had just gone slow still ranked as the fast one (`ustc-glm`, 2026-11-24: window median 1.4 s, newest probe 10.2 s, ranked second-fastest). The window keeps those medians for context, but everything that *decides* something reads a verdict over the **recency cohort** (`stats.recentMs`, default = one `sampling.intervalMs`):
+**A six-hour median is not a verdict.** With sparse sampling — long idle gaps between sessions — a fresh 10.2 s measurement used to lose against four 1.3 s measurements from hours earlier, so the model that had just gone slow still ranked as the fast one (`model-big`, 2026-11-24: window median 1.4 s, newest probe 10.2 s, ranked second-fastest). The window keeps those medians for context, but everything that *decides* something reads a verdict over the **recency cohort** (`stats.recentMs`, default = one `sampling.intervalMs`):
 
 1. the recent cohort when it has a timed sample — one fresh reading beats any number of old ones,
 2. otherwise the window median, if the newest sample is inside `stats.staleMs` (default 2 × the cohort),
@@ -39,7 +39,7 @@ This replaces the old "run a probe script when you remember to" flow. An externa
 
 **Slow-streak failover.** If the current model is slow — TTFT over the threshold, TPOT over the threshold, or a turn whose wall clock exceeded `turnWallMs` (bucketed by prompt size) — for `window` of the last turns, the extension switches to the fastest **other model of the same provider**. It never crosses providers, because that changes pricing and capabilities behind your back.
 
-Staleness is judged per sample from the time it **ended** (`streakMaxAgeMs`), never from a sample's start. The earlier rule dropped the whole streak as soon as any sample had started more than `cooldownMs` ago, which is always true when turns take minutes — so failover was dead on exactly the gateways it exists for (limbus lane U, 2026-11-23: TTFT 147 s / 130 s / 904 s / 303 s on `ustc-dsf`, never switched, 73 minutes burned). `tests/streak.test.mjs` replays those samples.
+Staleness is judged per sample from the time it **ended** (`streakMaxAgeMs`), never from a sample's start. The earlier rule dropped the whole streak as soon as any sample had started more than `cooldownMs` ago, which is always true when turns take minutes — so failover was dead on exactly the gateways it exists for (a production lane, 2026-11-23: TTFT 147 s / 130 s / 904 s / 303 s on `model-fast`, never switched, 73 minutes burned). `tests/streak.test.mjs` replays those samples.
 
 **A hung request is not a slow turn.** `turn_end` never fires while a request is stuck, so a gateway that accepts the call and then sends nothing used to hang the session until Pi's HTTP idle timeout — and the retry landed on the same model. A stall timer is armed at `before_provider_request`:
 
@@ -56,7 +56,7 @@ Guards: once per `cooldownMs`, at most once per session, skipped while a manual 
 
 **A warm session is expensive to leave.** Switching models discards the gateway's prefix cache and re-pays for the whole prompt, so a session that has already run `sessionBinding.warmTurns` turns (or `warmAfterMs` of wall time, or one turn whose prompt is past `thresholds.largePromptTokens`) is *bound*: its slow thresholds are multiplied by `boundThresholdMultiplier`, TTFT never triggers a switch below `boundMinTtftMs`, and the switch log/notification says `session bound`. A bound session stays on a model that is 20% slower, and still walks away from one that stalls for a minute.
 
-**Never inside a child with a pinned model.** A background pi-subagents child (`PI_SUBAGENT_CHILD=1`, set by the runner) keeps the model its parent assigned: the parent verifies every assistant message against the launch candidate and fails the whole run with `model_verification_failed` ("Expected 'custom.ustc-pool/ustc-glm:high' but observed 'ustc-dsf2'") — even though the work finished. The same pin applies to any `PI_FABRIC_*` lineage marker; Pi Fabric was uninstalled in 2026-11-24, so the marker check is only a no-op compatibility guard. Sampling still runs in children, so their timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging. The abort half of the stall watchdog still applies: it ends the turn, it does not change the model.
+**Never inside a child with a pinned model.** A background pi-subagents child (`PI_SUBAGENT_CHILD=1`, set by the runner) keeps the model its parent assigned: the parent verifies every assistant message against the launch candidate and fails the whole run with `model_verification_failed` ("Expected 'my-gateway/model-big:high' but observed 'model-fast2'") — even though the work finished. The same pin applies to any `PI_FABRIC_*` lineage marker; Pi Fabric was uninstalled in 2026-11-24, so the marker check is only a no-op compatibility guard. Sampling still runs in children, so their timings feed the shared ranking. `PI_MODEL_SPEED_ALLOW_CHILD=1` opts back in for debugging. The abort half of the stall watchdog still applies: it ends the turn, it does not change the model.
 
 **Where it runs.** Ambient extensions load in the parent session and in *background* subagent children (`async: true`), which is where the stall watchdog earns its keep. Local *foreground* children (`async: false`) never load ambient extensions, so neither sampling nor failover happens there; opt in per agent with `subagentOnlyExtensions` when you need it.
 
@@ -78,7 +78,7 @@ Restart Pi (or `/reload`).
 | `/speed-probe` | Sample the stale pool models now (background); `/speed-probe --force` ignores freshness; `/speed-probe <model…>` samples exactly those; `--external` runs the legacy probe script |
 | `/speed-stats` | This session's TTFT/TPOT medians, the remembered switch budget, and the rolling recent window |
 | `/speed-auto on\|off` | Toggle failover for this session |
-| `/speed-router` | The `ustc-auto` virtual model: chain, per-model health, and the model it would pick now |
+| `/speed-router` | The `auto` virtual model: chain, per-model health, and the model it would pick now |
 | `/speed-pick` | Print the provider-qualified model the router would use now — use it when dispatching a subagent |
 
 ## Configuration
@@ -189,17 +189,36 @@ Recent measured data deliberately outranks an external probe file: a probe with 
 
 A gateway can fail over on its own, but the client has to *stop switching* for that to be useful: pi-subagents verifies every assistant message against the launch candidate and fails the whole run with `model_verification_failed` when a child changed models mid-run (2026-11-24, run `e5a8e44a`: the review was delivered and the run was thrown away). The old answer was to pin children to one model; that is safe but leaves the child on a model the pool has already given up on.
 
-With `virtual.enabled`, the extension registers a **virtual model** (`custom.ustc-pool/ustc-auto`) whose `route()` picks the physical model per request:
+With `virtual.enabled`, the extension registers a **virtual model** (`my-gateway/auto` by default) whose `route()` picks the physical model per request.
+
+> **The shipped `virtual` defaults are placeholders** (`provider: "my-gateway"`, `id: "auto"`) — replace them with your own gateway and models in `~/.pi/agent/model-speed.json`. Example (illustrative, swap in your own values):
+>
+> ```json
+> {
+>   "virtual": {
+>     "enabled": true,
+>     "provider": "my-gateway",
+>     "id": "auto",
+>     "name": "auto (health-routed)",
+>     "chain": ["model-a", "model-b", "model-c", "model-d"]
+>   }
+> }
+> ```
 
 - the **selection** never changes, so the parent's verification, the prompt cache and the thinking signatures stay valid;
-- the chain (`ustc-dsf → ustc-dsf2 → ustc-glm → ustc-qwen`) is the preference order, and a later entry is promoted only on a **clear** win (`virtual.minGainRatio`, 2×) — the chain encodes capability, not just speed;
+- the chain (`model-a → model-b → model-c → model-d`) is the preference order, and a later entry is promoted only on a **clear** win (`virtual.minGainRatio`, 2×) — the chain encodes capability, not just speed;
 - a `continuation` keeps the model that answered last; a `retry` steps off the failed model and parks it for `virtual.quarantineMs`;
 - the **256k model is never given a request that needs more** than it holds (live context usage when Pi has it, otherwise a character estimate, plus `virtual.headroomTokens`);
 - a model whose newest answer was **empty or special-token garbage** is not a target, however fast its TTFT was.
 
 That last rule is the one a stopwatch cannot express. deepseek-flash-2 answered HTTP 200 with `<｜DSML｜>…` bodies on 2026-11-25; four subagent lanes exited 0 with zero output while every latency field said "healthy, fast". Content is now classified on every real turn (`empty`, `garbage`, `chars` in the log) and on every synthetic sample, `stats` counts it (`invalid` / `recentInvalid`), and `verdict()` refuses to rank a model whose newest evidence is garbage. One good answer after the streak clears it — no manual reset.
 
-**Children.** Foreground pi-subagents children do not load ambient extensions, and virtual models are not part of provider registration, so a foreground child cannot resolve `ustc-auto` (the gateway answers `400 Invalid model name`). Background (`async: true`) children do load ambient extensions, so they can be launched on `custom.ustc-pool/ustc-auto` (pi-subagents documents ambient discovery for background children; verify on the first lane in a new environment). For that reason the shipped defaults are: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `/speed-pick` instead of guessing, or dispatch a background lane on the virtual one.
+**Children.** Virtual models are not part of provider registration, and subagent children do not load ambient extensions by default (the resolved-extension list of a launch contains only the subagent runtime). A child launched on the virtual model therefore sends `auto` upstream and the gateway answers `400 Invalid model name` (measured, 2026-11-25). Two ways out:
+
+- give the child this extension explicitly (works for foreground and background children):
+  `~/.pi/agent/settings.json` → `"subagents": { "defaultSubagentOnlyExtensions": ["<path>/packages/model-speed/extensions/index.ts"] }`,
+  then `"defaultModel": "my-gateway/auto"` resolves inside the child, the request is routed to a physical model, and pi-subagents' model verification still passes (it compares the *virtual selection*, which never changes). Verified end to end with an `async` scout launched on `auto:minimal`;
+- or keep children on a physical model and pick it with `/speed-pick` / from `/speed-router` health.  The recommended setup is: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `/speed-pick` instead of guessing, or dispatch a background lane on the virtual one.
 
 `PI_MODEL_SPEED_SAMPLING_ALLOW_CHILD=1` re-enables pool sampling inside a pinned child (off by default: a worker on one model only adds gateway load beside the parent's samples).
 
