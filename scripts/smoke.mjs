@@ -311,7 +311,7 @@ rmSync(root, { recursive: true, force: true });
 		const modelSpeed = await import("../packages/model-speed/extensions/index.ts");
 		const commands = new Map();
 		const notices = [];
-		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition) });
+		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
 		const command = commands.get("speed-auto");
 		assert.ok(command, "/speed-auto is registered");
 		await command.handler("on", { ui: { notify: (message) => notices.push(message) } });
@@ -333,7 +333,7 @@ check("model-speed: a pi-subagents child cannot switch models", () => {
 		const modelSpeed = await import(${JSON.stringify(new URL("../packages/model-speed/extensions/index.ts", import.meta.url).href)});
 		const commands = new Map();
 		const notices = [];
-		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition) });
+		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
 		await commands.get("speed-auto").handler("on", { ui: { notify: (m) => notices.push(m) } });
 		process.stdout.write(notices.at(-1) ?? "");
 	`;
