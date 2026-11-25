@@ -2,22 +2,29 @@
 
 Small, dependency-free [Pi](https://pi.dev) extensions, extracted from daily use. Each one is an independent npm package; install only what you need.
 
-| Package | npm | What it fixes |
+> **Status (2026-11-25):** the three `fabric-*` packages are **archived / no longer installed or maintained** —
+> upstream `pi-fabric` was retired on 2026-11-21 and this machine now orchestrates with `pi-subagents`. Their
+> code stays here (and on npm) for anyone still running Fabric; nothing here patches modern Pi. Only
+> **`pi-model-speed`** is active.
+
+| Package | npm | Status / what it fixes |
 | --- | --- | --- |
-| [**pi-fabric-agent-echo**](packages/fabric-agent-echo) | [![npm](https://img.shields.io/npm/v/pi-fabric-agent-echo.svg)](https://www.npmjs.com/package/pi-fabric-agent-echo) | Completed [pi-fabric](https://github.com/fabric-runtime/pi-fabric) subagent conversations stay in your transcript as collapsible, model-invisible cards instead of disappearing behind `/fabric chat`. |
+| [**pi-fabric-agent-echo**](packages/fabric-agent-echo) | [![npm](https://img.shields.io/npm/v/pi-fabric-agent-echo.svg)](https://www.npmjs.com/package/pi-fabric-agent-echo) | ⚠️ archived (Fabric retired). Completed [pi-fabric](https://github.com/fabric-runtime/pi-fabric) subagent conversations stay in your transcript as collapsible, model-invisible cards instead of disappearing behind `/fabric chat`. |
 | [**pi-model-speed**](packages/model-speed) | [![npm](https://img.shields.io/npm/v/pi-model-speed.svg)](https://www.npmjs.com/package/pi-model-speed) | Measures real TTFT/TPOT per request and steps off a model that is consistently slow — within the same provider, never across. |
-| [**pi-fabric-hardening**](packages/fabric-hardening) | [![npm](https://img.shields.io/npm/v/pi-fabric-hardening.svg)](https://www.npmjs.com/package/pi-fabric-hardening) | Idempotent runtime patches for pi-fabric/pi-fold/pi-grow-loop: survive a full tmpfs, keep the real cause of a dead child, configurable recovery watchdog, and no self-scheduling inside a Fabric child. |
-| [**pi-fabric-resume**](packages/fabric-resume) | [![npm](https://img.shields.io/npm/v/pi-fabric-resume.svg)](https://www.npmjs.com/package/pi-fabric-resume) | Resumable Fabric children without forking pi-fabric: every child keeps its own session, so `agents.resume({ id })` continues an interrupted, crashed or post-reboot run from its own transcript. |
+| [**pi-fabric-hardening**](packages/fabric-hardening) | [![npm](https://img.shields.io/npm/v/pi-fabric-hardening.svg)](https://www.npmjs.com/package/pi-fabric-hardening) | ⚠️ archived (Fabric retired). Idempotent runtime patches for pi-fabric/pi-fold/pi-grow-loop: survive a full tmpfs, keep the real cause of a dead child, configurable recovery watchdog, and no self-scheduling inside a Fabric child. |
+| [**pi-fabric-resume**](packages/fabric-resume) | [![npm](https://img.shields.io/npm/v/pi-fabric-resume.svg)](https://www.npmjs.com/package/pi-fabric-resume) | ⚠️ archived (Fabric retired). Resumable Fabric children without forking pi-fabric: every child keeps its own session, so `agents.resume({ id })` continues an interrupted, crashed or post-reboot run from its own transcript. |
 
 ## Install
 
-All three are published on npm (`latest` = 0.1.0) and carry the `pi-package` keyword, so they show up in the Pi package gallery.
+All four are published on npm and carry the `pi-package` keyword. **`pi-model-speed` is the only one to install today**;
+the `fabric-*` ones are archived (see the status note above).
 
 ```bash
-pi install npm:pi-fabric-agent-echo
 pi install npm:pi-model-speed
-pi install npm:pi-fabric-hardening
-pi install npm:pi-fabric-resume
+# archived, Fabric-only — kept for old Fabric installs:
+# pi install npm:pi-fabric-agent-echo
+# pi install npm:pi-fabric-hardening
+# pi install npm:pi-fabric-resume
 ```
 
 From a checkout instead:
@@ -43,7 +50,7 @@ These extensions were written against the same constraints, and it shows:
 
 - Pi 1.5.x or newer (`pi` with extension discovery and `/reload`).
 - Node 22+ for the repository's own smoke script; the extensions themselves only use stable Node APIs.
-- `pi-fabric` for `fabric-agent-echo`, `fabric-hardening` and `fabric-resume`; `pi-fold` additionally for the pi-fold patch (it is skipped when absent).
+- `pi-fabric` for the archived `fabric-agent-echo`, `fabric-hardening` and `fabric-resume` (they fail soft when it is absent — which is the state of this machine since 2026-11-21).
 
 ## Development
 
