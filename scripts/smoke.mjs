@@ -283,7 +283,7 @@ rmSync(root, { recursive: true, force: true });
 		const modelSpeed = await import("../packages/model-speed/extensions/index.ts");
 		const commands = new Map();
 		const notices = [];
-		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
+		await modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
 		const command = commands.get("speed");
 		assert.ok(command, "/speed is registered");
 		await command.handler("auto on", { ui: { notify: (message) => notices.push(message) } });
@@ -305,7 +305,7 @@ check("model-speed: a pi-subagents child cannot switch models", () => {
 		const modelSpeed = await import(${JSON.stringify(new URL("../packages/model-speed/extensions/index.ts", import.meta.url).href)});
 		const commands = new Map();
 		const notices = [];
-		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
+		await modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
 		await commands.get("speed").handler("auto on", { ui: { notify: (m) => notices.push(m) } });
 		process.stdout.write(notices.at(-1) ?? "");
 	`;
@@ -353,7 +353,7 @@ check("model-speed: a reloaded session remembers its switch budget", () => {
 			},
 			getContextUsage: () => ({ tokens: 4_000 }),
 		};
-		modelSpeed.default({
+		await modelSpeed.default({
 			on: (name, fn) => handlers.set(name, fn),
 			registerCommand: () => {},
 			setModel: async (target) => { switched = target.id; return true; },
@@ -411,7 +411,7 @@ check("model-speed: a fresh slow probe outranks an old fast median", () => {
 			modelRegistry: { getAvailable: () => [model, { id: "ustc-glm", provider: "custom.ustc-pool" }], find: (_p, id) => ({ id, provider: "custom.ustc-pool" }) },
 			getContextUsage: () => ({ tokens: 2_000 }),
 		};
-		modelSpeed.default({ on: (n, f) => handlers.set(n, f), registerCommand: (id, d) => commands.set(id, d), setModel: async () => true });
+		await modelSpeed.default({ on: (n, f) => handlers.set(n, f), registerCommand: (id, d) => commands.set(id, d), setModel: async () => true });
 		await commands.get("speed").handler("", ctx);
 		process.stdout.write(notes.join("\\n"));
 	`;

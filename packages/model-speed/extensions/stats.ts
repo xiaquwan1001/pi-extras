@@ -70,6 +70,10 @@ export type ModelStat = {
 	recentTokensPerSec?: number;
 	/** Failed samples inside the recent cohort — a fresh failure outranks an old success. */
 	recentErrors: number;
+	/** End time of the newest failed sample (error/timeout), ms. Undefined = never failed. */
+	errorLastAt?: number;
+	/** End time of the newest answer that was neither an error nor empty/garbage, ms. */
+	answerLastAt?: number;
 	/** Samples whose *content* was empty or garbage (a HTTP 200 failure, invisible to `errors`). */
 	invalid: number;
 	/** Same, inside the recent cohort. */
@@ -168,6 +172,11 @@ export function aggregate(records: SpeedRecord[], options: AggregateOptions): Ma
 		const large = timed.filter((r) => (r.promptTokens ?? 0) >= options.largePromptTokens);
 		const tps = list.map(recordTokensPerSec).filter((v): v is number => typeof v === "number" && Number.isFinite(v));
 		const invalidList = list.filter((r) => Boolean(r.empty || r.garbage));
+		// Two "newest evidence" clocks: the newest failure, and the newest answer that was
+		// neither an error nor empty/garbage. `verdict()` compares them, so a model that has
+		// simply been answering well since a timeout is rankable again without a manual reset.
+		const errorTimes = list.filter((r) => Boolean(r.error)).map(endOf);
+		const answerTimes = list.filter((r) => !r.error && !r.empty && !r.garbage).map(endOf);
 		const validTimes = timed.filter((r) => !r.empty && !r.garbage).map(endOf);
 		const invalidTimes = invalidList.map(endOf);
 		const probeTimes = list.filter((r) => r.kind === "probe").map(endOf);
@@ -200,6 +209,8 @@ export function aggregate(records: SpeedRecord[], options: AggregateOptions): Ma
 			lastProbeAt: probeTimes.length ? Math.max(...probeTimes) : undefined,
 			recentN: recentTimed.length,
 			recentErrors: list.filter((r) => endOf(r) >= recentCutoff && Boolean(r.error)).length,
+			errorLastAt: errorTimes.length ? Math.max(...errorTimes) : undefined,
+			answerLastAt: answerTimes.length ? Math.max(...answerTimes) : undefined,
 			invalid: invalidList.length,
 			recentInvalid,
 			invalidLastAt: invalidTimes.length ? Math.max(...invalidTimes) : undefined,
@@ -236,7 +247,18 @@ export type Verdict = {
 export type VerdictOptions = {
 	now: number;
 	largePromptTokens: number;
-	/** Session context size: at or above `largePromptTokens` the large-prompt number is used. */
+	/**
+	 * Size of the prompt this request will actually send, which decides the small/large bucket.
+	 * Keep this separate from `needTokens`: the context-window guard adds `headroomTokens`, and
+	 * adding reply headroom to the *bucket* made every session with a 48 k headroom read the
+	 * large-prompt number even when its prompt was 5 k tokens (two different questions,
+	 * 2026-11-27).
+	 */
+	promptTokens?: number;
+	/**
+	 * Session context size including headroom: at or above `largePromptTokens` the large-prompt
+	 * number is used *only* when `promptTokens` is absent (compatibility). Prefer `promptTokens`.
+	 */
 	needTokens?: number;
 	/** No measurement newer than this means "unknown", never "fast". */
 	staleMs?: number;
@@ -255,7 +277,7 @@ export type VerdictOptions = {
  *      as "unknown" and never pick it as a target.
  */
 export function verdict(stat: ModelStat, options: VerdictOptions): Verdict {
-	const large = (options.needTokens ?? 0) >= options.largePromptTokens;
+	const large = (options.promptTokens ?? options.needTokens ?? 0) >= options.largePromptTokens;
 	const bucket: "small" | "large" = large ? "large" : "small";
 	const pick = (small?: number, big?: number) => (large ? (big ?? small) : (small ?? big));
 	const ageMs = stat.lastAt ? Math.max(0, options.now - stat.lastAt) : undefined;
@@ -265,14 +287,18 @@ export function verdict(stat: ModelStat, options: VerdictOptions): Verdict {
 	if (isBroken(stat).invalid) {
 		return { ttftMs: undefined, tokensPerSec: stat.recentTokensPerSec ?? stat.tokensPerSec, source: "stale", ageMs, bucket };
 	}
+	// Newest evidence wins, failures included. The old rule only looked at `recentErrors` when
+	// the cohort had *no* timed sample: a model that answered in 500 ms ten minutes ago and
+	// then timed out one minute ago still ranked as "recent 500 ms" while `isBroken().failed`
+	// said it had failed — so `/speed` and the switch target list would walk onto a model the
+	// router itself refused (audit, 2026-11-27). A failure only disqualifies while it is the
+	// newest thing known: `answerLastAt >= errorLastAt` clears it without a manual reset.
+	if (isBroken(stat).failed) {
+		return { ttftMs: undefined, tokensPerSec: stat.recentTokensPerSec ?? stat.tokensPerSec, source: "stale", ageMs, bucket };
+	}
 	const recentTtft = pick(stat.recentTtftMs, stat.recentTtftLargeMs);
 	if (stat.recentN > 0 && recentTtft !== undefined) {
 		return { ttftMs: recentTtft, tokensPerSec: stat.recentTokensPerSec ?? stat.tokensPerSec, source: "recent", ageMs, bucket };
-	}
-	// A model that just failed is not a target, however good its older numbers were: the
-	// failure is the newest thing known about it.
-	if (stat.recentErrors > 0) {
-		return { ttftMs: undefined, tokensPerSec: stat.recentTokensPerSec ?? stat.tokensPerSec, source: "stale", ageMs, bucket };
 	}
 	const staleMs = options.staleMs ?? Number.POSITIVE_INFINITY;
 	const windowTtft = pick(stat.ttftMs, stat.ttftLargeMs);
@@ -290,9 +316,13 @@ export function verdict(stat: ModelStat, options: VerdictOptions): Verdict {
  * clears the mark, so a model that recovered is usable again without a manual reset.
  */
 export function isBroken(stat: ModelStat): { invalid: boolean; failed: boolean } {
+	// Both flags mean "the newest thing known about it is bad". Using `recentErrors > 0` for
+	// failures made a model unrankable for a whole cohort after one timeout even though it had
+	// answered ten times since; comparing clocks keeps the rule one sentence long.
+	const newestAnswer = stat.answerLastAt ?? stat.validLastAt ?? 0;
 	return {
 		invalid: stat.recentInvalid > 0 && (stat.invalidLastAt ?? 0) >= (stat.validLastAt ?? 0),
-		failed: stat.recentErrors > 0,
+		failed: stat.errorLastAt !== undefined && stat.errorLastAt >= newestAnswer,
 	};
 }
 

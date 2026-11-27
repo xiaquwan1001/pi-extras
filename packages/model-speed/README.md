@@ -17,13 +17,15 @@ Two details that make the numbers trustworthy rather than decorative:
 
 Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl` (every line carries the `session` it belongs to), and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
 
-**A six-hour median is not a verdict.** With sparse sampling — long idle gaps between sessions — a fresh 10.2 s measurement used to lose against four 1.3 s measurements from hours earlier, so the model that had just gone slow still ranked as the fast one (`model-big`, 2026-11-24: window median 1.4 s, newest probe 10.2 s, ranked second-fastest). The window keeps those medians for context, but everything that *decides* something reads a verdict over the **recency cohort** (`stats.recentMs`, default = one `sampling.intervalMs`):
+**A six-hour median is not a verdict.** With sparse sampling — long idle gaps between sessions — a fresh 10.2 s measurement used to lose against four 1.3 s measurements from hours earlier, so the model that had just gone slow still ranked as the fast one (`model-big`, 2026-11-24: window median 1.4 s, newest probe 10.2 s, ranked second-fastest). The window keeps those medians for context, but everything that *decides* something reads a verdict over the **recency cohort** (`stats.recentMs`, default = 1.5 × `sampling.intervalMs`):
 
 1. the recent cohort when it has a timed sample — one fresh reading beats any number of old ones,
 2. otherwise the window median, if the newest sample is inside `stats.staleMs` (default 2 × the cohort),
 3. otherwise **no TTFT at all** and the model is reported `stale`; a stale fast number is not a candidate, so the switch logic says "nothing clearly faster is known" instead of walking onto a slow model.
 
-A fresh **failure** counts the same as a fresh slow reading: if the newest sample in the cohort is a timeout or an HTTP error, the model is unrankable until it answers again — the failure is the newest thing known about it.
+A fresh **failure** counts the same as a fresh slow reading — but only while it is the *newest* evidence. `verdict()` and `isBroken()` compare `errorLastAt` with `answerLastAt`: a timeout one minute ago disqualifies a model whose last answer was ten minutes ago, and one answer after the timeout clears it again. (Before 2026-11-27 only the "no timed sample in the cohort" branch looked at failures, so a model that answered in 500 ms and then timed out still ranked as `recent 500 ms` while the router refused it — two consumers, two answers.)
+
+**The prompt-size bucket is the prompt, not the guard.** Small/large TTFT is chosen by `promptTokens` (live context usage), never by `needTokens`, which carries `headroomTokens` (48 k here) for the context-window check. Adding headroom to the bucket made every session with a 5 k prompt read the large-context median; the router made the opposite mistake and always read the small one. Both now pass the actual prompt size, and the router's health snapshot keeps the last live usage for when it runs without a context.
 
 The external probe file has the same rule via `probe.maxAgeMs`: past that age it is history, shown in `/speed` but never used as a ranking source.
 
@@ -84,7 +86,7 @@ Restart Pi (or `/reload`).
 | `/speed stats` | This session's TTFT/TPOT medians, the remembered switch budget, and the rolling recent window |
 | `/speed auto on\|off` | Toggle failover for this session |
 | `/speed router` | The `auto` virtual model: chain, per-model health, and the model it would pick now |
-| `/speed pick [retry]` | Print the provider-qualified model the router would use now — use it when dispatching a subagent |
+| `/speed pick [retry]` | Print the provider-qualified model the router would use now (the human-facing twin of the `model_health` tool) |
 
 Autocomplete (`getArgumentCompletions`) offers the subcommands and their arguments, so `/speed ` + Tab lists them. The former `/speed-probe`, `/speed-stats`, `/speed-auto`, `/speed-router`, `/speed-pick` commands were **removed** — five extra entries in the slash-command list for what one argument does.
 
@@ -133,7 +135,7 @@ Optional file `~/.pi/agent/model-speed.json`:
     "providers": [],
     "models": []
   },
-  "stats": { "windowMs": 21600000, "recentMs": 1800000, "staleMs": 3600000 },
+  "stats": { "windowMs": 21600000, "recentMs": 2700000, "staleMs": 5400000 },
   "probe": {
     "command": ["bash", "/home/me/bin/model-probe.sh"],
     "file": "/home/me/.cache/model-probe.json",
@@ -178,7 +180,7 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `sampling.providers` | `[]` | Providers to sample; empty = `providers`, then the current session's provider |
 | `sampling.models` | `[]` | Model ids or `provider/id` to sample; empty = every model of those providers |
 | `stats.windowMs` | `21600000` | Rolling window used for the medians in `/speed` and `stats.json` (6 h) (`PI_MODEL_SPEED_STATS_WINDOW_MS`) |
-| `stats.recentMs` | = `sampling.intervalMs` | Recency cohort that decides the verdict ranking uses (`PI_MODEL_SPEED_RECENT_MS`; `0` = always use the whole window) |
+| `stats.recentMs` | = 1.5 × `sampling.intervalMs` | Recency cohort that decides the verdict ranking uses (`PI_MODEL_SPEED_RECENT_MS`; `0` = always use the whole window). 1.5 rather than 1: one run samples `maxModels` models sequentially, and the measured gap was a median 33.5 min against a 30 min interval, so a cohort equal to the interval left every model outside its own cohort for ~3.5 min per cycle |
 | `stats.staleMs` | = 2 × `stats.recentMs` | No measurement newer than this means the model is *unknown*, never "fast" (`PI_MODEL_SPEED_STALE_MS`) |
 | `probe.command` | — | Legacy external probe, only run by `/speed probe --external` |
 | `probe.file` | — | That probe's output: `{ "ts": 1700000000, "models": { "<id>": { "ok": true, "ttft": 1.2 } } }` (`ttft` in seconds) |
@@ -225,7 +227,18 @@ That last rule is the one a stopwatch cannot express. deepseek-flash-2 answered 
 - give the child this extension explicitly (works for foreground and background children):
   `~/.pi/agent/settings.json` → `"subagents": { "defaultSubagentOnlyExtensions": ["<path>/packages/model-speed/extensions/index.ts"] }`,
   then `"defaultModel": "my-gateway/auto"` resolves inside the child, the request is routed to a physical model, and pi-subagents' model verification still passes (it compares the *virtual selection*, which never changes). Verified end to end with an `async` scout launched on `auto:minimal`;
-- or keep children on a physical model and pick it with `/speed pick` / from `/speed router` health.  The recommended setup is: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `/speed pick` instead of guessing, or dispatch a background lane on the virtual one.
+- or keep children on a physical model and pick it with `model_health` (the agent-facing tool) or `/speed pick` (the human-facing command) / from `/speed router` health.  The recommended setup is: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `model_health` instead of guessing, or dispatch a background lane on the virtual one.
+
+## Agent awareness: the pool is not only for humans
+
+Auto failover and `/speed` answer "should *this session* move". They never answered the question an agent asks when it dispatches work — "which model is answering fastest right now, and does it fit this task?" — so dispatches kept using a hardcoded rotation that the window could contradict.
+
+Two surfaces close that, both read-only and both re-using the rolling window (no gateway traffic):
+
+- **`model_health` tool.** `rank: "recent"` (default) sorts by the verdict alone: fastest healthy model that fits the context, no capability preference. `rank: "preferred"` is the chain order, promoted only on a `virtual.minGainRatio` win — use it when capability should beat latency. The reply carries per-model `ttftMs` (in the bucket the session will use), `tokensPerSec`, `ageMs`, `source` (`recent`/`window`/`stale`/`none`), `invalid`/`failed`, `contextWindow` and `fits`, plus `pick`, `preferred`, `unknown` and a `note` (bound session, current model vs fastest). Every call writes a `kind:"pick"` line listing the evidence, so "the pick was right" stays checkable afterwards.
+- **A one-line prompt section.** `before_agent_start` adds `sections["model-health"]` — `recent TTFT: dsf 0.41s · qwen 0.49s … | pick=<provider>/<model> | dispatch: <provider>/<pick>`. Pi diffs prompt sections against what the model already has, so an unchanged line costs nothing (no extra system message, no cache miss); it is only re-sent when the pool actually changes. Skipped in pinned children and with `PI_MODEL_SPEED=0`.
+
+The rule for a *dispatch* is deliberately looser than for a mid-session switch: a session bound to a warm prefix cache must not leave for a 1.2× win, but a fresh subagent pays nothing, so the recency pick wins. A 256k model is still excluded by `contextWindow`, never by speed.
 
 `PI_MODEL_SPEED_SAMPLING_ALLOW_CHILD=1` re-enables pool sampling inside a pinned child (off by default: a worker on one model only adds gateway load beside the parent's samples).
 
@@ -241,6 +254,8 @@ That last rule is the one a stopwatch cannot express. deepseek-flash-2 answered 
 | `switch` | The switch that happened (`from`/`to`, `reason` = `slow` or `stall`, `switches` = budget used) |
 | `session-start` | A reload/resume/fork restored memory (`restoredFrom`, `samples`, `switches`, `target`) |
 | `model-select` | The user changed the model, so the switch budget was cleared |
+| `pick` | An agent-facing pick (`model_health`): `rank`, `pick`, and the per-model evidence (`models`), so a choice can be audited later |
+| `orphan` | A request that never reached `message_end` was dropped at the next request instead of stealing its timing |
 | `switch-skip` | Why it did **not** happen: `auto off`, `switch budget spent`, `switch cooldown`, `provider … not in allowlist`, `fabric child` / `subagent child`, `target … missing from registry`, `setModel(…) refused`, or `no clearly faster same-provider target` — the last one also logs the ranking it saw (`ranked`, `excluded`, `needTokens`, `currentMedian`) |
 
 `sampler-state.json` carries the lease (`lastRunAt`) and the last run summary; `stats.json` is the rolling window at the last write; `switch-state.json` holds the global history plus `sessions.<key>` (per-conversation budget, target and abandoned models, pruned to the 20 newest). Every log line carries `session`, so `grep <session-key>` answers "what did this conversation experience, and what did it switch to".

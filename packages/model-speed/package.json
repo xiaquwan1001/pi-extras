@@ -1,7 +1,7 @@
 {
   "name": "pi-model-speed",
-  "version": "0.6.0",
-  "description": "Measure real TTFT/TPOT and token throughput in Pi, sample the whole provider pool automatically, route a virtual model by health, and step off a model that is consistently slow or silently broken.",
+  "version": "0.7.0",
+  "description": "Measure real TTFT/TPOT and token throughput in Pi, sample the whole provider pool automatically, expose the measured pool to the agent (model_health), route a virtual model by health, and step off a model that is consistently slow or silently broken.",
   "type": "module",
   "license": "MIT",
   "author": "Qianhui Xu",
@@ -19,6 +19,7 @@
     "failover",
     "latency",
     "model-selection",
+    "agent-tooling",
     "pi-extension",
     "pi-package",
     "ttft",

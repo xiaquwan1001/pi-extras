@@ -297,7 +297,7 @@ const DEFAULT_CONFIG: Config = {
 		minImprovementMs: 5_000,
 	},
 	contextGuard: { enabled: true, headroomTokens: 32_000 },
-	probe: {},
+	probe: { maxAgeMs: 3_600_000 },
 	sampling: {
 		enabled: process.env.PI_MODEL_SPEED_SAMPLING !== "0",
 		intervalMs: 1_800_000,
@@ -311,7 +311,7 @@ const DEFAULT_CONFIG: Config = {
 		providers: [],
 		models: [],
 	},
-	stats: { windowMs: 21_600_000, recentMs: 1_800_000, staleMs: 3_600_000 },
+	stats: { windowMs: 21_600_000, recentMs: 2_700_000, staleMs: 5_400_000 },
 	virtual: {
 		enabled: false,
 		// Placeholder defaults: configure your own provider/id in ~/.pi/agent/model-speed.json (see README).
@@ -457,9 +457,15 @@ async function loadConfig(): Promise<Config> {
 	const disabled = process.env.PI_MODEL_SPEED === "0" || (PINNED_CHILD && !AUTO_IN_CHILD);
 	const window = Math.max(2, Math.floor(num(process.env.PI_MODEL_SPEED_WINDOW, num(raw.window, 3))));
 	// The verdict cohort defaults to the sampling cadence: one sampling interval is exactly
-	// the set of measurements that still describe "now"; older ones only dilute them.
+	// the set of measurements that still describe "now"; older ones only dilute them. It is
+	// 1.5 intervals, not 1: one run samples `maxModels` models sequentially, so the observed
+	// gap between two samples of the same model was a median 33.5 min against a 30 min
+	// interval (measured 2026-11-27). With a cohort equal to the interval, every model spent
+	// ~3.5 min per cycle outside its own cohort — falling back to the 6 h median at exactly
+	// the moment the fresh number mattered.
 	const recentMs = (() => {
-		const fallback = num(raw.sampling?.intervalMs, DEFAULT_CONFIG.sampling.intervalMs);
+		const intervalMs = num(raw.sampling?.intervalMs, DEFAULT_CONFIG.sampling.intervalMs);
+		const fallback = Math.round(intervalMs * 1.5);
 		const n = Number(process.env.PI_MODEL_SPEED_RECENT_MS ?? raw.stats?.recentMs ?? fallback);
 		return Number.isFinite(n) && n >= 0 ? n : DEFAULT_CONFIG.stats.recentMs;
 	})();
@@ -651,12 +657,22 @@ async function restoreSessionSamples(key: string): Promise<Sample[]> {
 	}
 }
 
+/** Keep a log line small: a gateway 502 body used to be stored verbatim, forever. */
+function trimForLog(value: unknown, depth = 0): unknown {
+	if (typeof value === "string") return value.length > 400 ? `${value.slice(0, 400)}…` : value;
+	if (!value || typeof value !== "object" || depth > 4) return value;
+	if (Array.isArray(value)) return value.map((item) => trimForLog(item, depth + 1));
+	const out: Record<string, unknown> = {};
+	for (const [key, item] of Object.entries(value as Record<string, unknown>)) out[key] = trimForLog(item, depth + 1);
+	return out;
+}
+
 async function appendLog(entry: Record<string, unknown>) {
 	try {
 		await mkdir(STATE_DIR, { recursive: true });
 		// Every line carries the conversation it belongs to: that is what lets a resumed
 		// session rebuild its own history instead of starting from zero.
-		await appendFile(LOG, `${JSON.stringify({ ts: Date.now(), session: sessionKey, ...entry })}\n`);
+		await appendFile(LOG, `${JSON.stringify(trimForLog({ ts: Date.now(), session: sessionKey, ...entry }))}\n`);
 		// A measured sample changes the rolling window, so the cached aggregate is stale.
 		if (entry.kind === "sample" || entry.kind === "probe") statsCache = undefined;
 		// A log that only grows would make every history read slower forever. One
@@ -707,18 +723,51 @@ async function recentStats(force = false): Promise<Map<string, ModelStat>> {
 }
 
 /**
+ * Live prompt size of this session (no headroom), used for the small/large TTFT bucket.
+ *
+ * Set wherever Pi exposes context usage; the fallbacks are the last real prompt this session
+ * sent. Keeping one holder is what lets `refreshRouteHealth()` (which runs without a ctx)
+ * rank by the bucket the session actually feels.
+ */
+let promptTokensNow = 0;
+
+function notePromptTokens(tokens: number | undefined): void {
+	if (typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0) promptTokensNow = tokens;
+}
+
+/**
  * What this model is allowed to claim right now. `recent` wins over the 6 h median, and a
  * model measured only before `stats.staleMs` has **no** TTFT at all — an old fast number
  * masquerading as a candidate is exactly the bug this replaced (2026-11-24: glm measured
  * 10.2 s while its window median was 1.4 s, and it ranked as the fastest model).
+ *
+ * The bucket comes from the prompt this session will send, *not* from `needTokens`: the
+ * latter carries `headroomTokens` (48 k here), which is a context-window guard, not a size.
+ * `promptTokensNow` is the live usage read from Pi, refreshed by `notePromptTokens()`.
  */
-function statVerdict(stat: ModelStat, needTokens: number): Verdict {
+function statVerdict(stat: ModelStat, needTokens: number, promptTokens = promptTokensNow): Verdict {
 	return verdict(stat, {
 		now: Date.now(),
 		largePromptTokens: config.thresholds.largePromptTokens,
 		needTokens,
+		promptTokens,
 		staleMs: config.stats.staleMs,
 	});
+}
+
+/** Prompt size to judge the bucket by: live usage, else the newest real sample, else 0. */
+function promptTokensOf(ctx: ExtensionContext): number {
+	try {
+		const live = Number(ctx.getContextUsage?.()?.tokens ?? 0);
+		if (Number.isFinite(live) && live > 0) return live;
+	} catch {
+		/* not every mode exposes it */
+	}
+	for (let i = samples.length - 1; i >= 0; i -= 1) {
+		if (samples[i].error) continue;
+		return samples[i].promptTokens ?? 0;
+	}
+	return promptTokensNow;
 }
 
 // ---- virtual model: one selection, a physical model per request ----------
@@ -842,6 +891,9 @@ function registerAutoRouter(pi: ExtensionAPI) {
 			// in modes without usage. Taking the maximum keeps a CJK-heavy conversation from
 			// being under-counted into the 256k model.
 			const live = Number(ctx.getContextUsage?.()?.tokens ?? 0);
+			// The bucket is judged by the prompt itself, the guard by prompt + headroom.
+			if (live > 0) notePromptTokens(live);
+			const promptTokens = live > 0 ? live : estimateNeedTokens(request.messages, 0);
 			const needTokens = Math.max(live > 0 ? live : 0, estimateNeedTokens(request.messages, 0)) + cfg.headroomTokens;
 			const state = (request.state ?? undefined) as RouterState | undefined;
 			const choice = chooseRoute({
@@ -856,6 +908,9 @@ function registerAutoRouter(pi: ExtensionAPI) {
 				quarantineMs: cfg.quarantineMs,
 				minGainRatio: cfg.minGainRatio,
 			});
+			// Keep the health snapshot's bucket honest for the *next* rank: route() knows the
+			// prompt size even when Pi reports no usage yet.
+			if (promptTokens > 0) notePromptTokens(promptTokens);
 			// The chain is the contract; if the chosen id is missing from the catalog (a model
 			// removed from the gateway between samples), fall back along the chain instead of
 			// failing the turn.
@@ -946,6 +1001,7 @@ function contextNeed(ctx: ExtensionContext): number {
 		if (usage && typeof usage.tokens === "number" && usage.tokens > 0) {
 			tokens = usage.tokens;
 			live = true;
+			notePromptTokens(usage.tokens);
 		}
 	} catch {
 		/* not every mode exposes it */
@@ -965,10 +1021,10 @@ function contextNeed(ctx: ExtensionContext): number {
  * 200k-token session feels the large-context number, a fresh one the small one. Falling
  * back to whichever exists beats discarding a model because one size timed out.
  */
-function pickProbeTtft(entry: ProbeEntry, needTokens: number): number | undefined {
+function pickProbeTtft(entry: ProbeEntry, promptTokens: number): number | undefined {
 	const small = typeof entry.ttft === "number" ? entry.ttft : undefined;
 	const large = typeof entry.ttftLarge === "number" ? entry.ttftLarge : undefined;
-	if (needTokens > config.thresholds.largePromptTokens && large !== undefined) return large;
+	if (promptTokens >= config.thresholds.largePromptTokens && large !== undefined) return large;
 	return small ?? large;
 }
 
@@ -985,6 +1041,10 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 	const allowed = (id: string) =>
 		config.candidates.length === 0 || config.candidates.includes(id) || config.candidates.includes(`${provider}/${id}`);
 	const needTokens = contextNeed(ctx);
+	// Same split as inside the verdict: the guard uses prompt + headroom, the TTFT bucket uses
+	// the prompt only. Passing the guard number here made every session read "large" (audit).
+	const promptTokens = promptTokensOf(ctx);
+	notePromptTokens(promptTokens);
 	const currentId = ctx.model?.id;
 	const candidates: Candidate[] = [];
 	const excluded: ExcludedCandidate[] = [];
@@ -1000,7 +1060,7 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 		const entry = probeUsable ? probe?.models[model.id] : undefined;
 		// A fresh measurement wins over an older one: the verdict prefers the recency cohort,
 		// and it refuses to call a model fast when everything known about it is stale.
-		const current = stat ? statVerdict(stat, needTokens) : undefined;
+		const current = stat ? statVerdict(stat, needTokens, promptTokens) : undefined;
 		if (current && typeof current.ttftMs === "number") {
 			candidates.push({
 				id: model.id,
@@ -1012,10 +1072,10 @@ async function rankCandidates(ctx: ExtensionContext): Promise<Ranking> {
 			});
 		} else if (entry?.ok === false) {
 			candidates.push({ id: model.id, ttftMs: Number.POSITIVE_INFINITY, source: "probe", contextWindow, ageMs: probeAgeMs });
-		} else if (entry && pickProbeTtft(entry, needTokens) !== undefined) {
+		} else if (entry && pickProbeTtft(entry, promptTokens) !== undefined) {
 			candidates.push({
 				id: model.id,
-				ttftMs: pickProbeTtft(entry, needTokens)! * 1000,
+				ttftMs: pickProbeTtft(entry, promptTokens)! * 1000,
 				tokensPerSec: typeof (entry as { tokensPerSec?: number }).tokensPerSec === "number" ? (entry as { tokensPerSec: number }).tokensPerSec : undefined,
 				source: "probe",
 				contextWindow,
@@ -1040,6 +1100,225 @@ const describeExcluded = (excluded: ExcludedCandidate[], needTokens: number) =>
 	excluded.length === 0
 		? ""
 		: `; skipped for context: ${excluded.map((entry) => `${entry.id} (${entry.contextWindow} < ${needTokens})`).join(", ")}`;
+
+// ---- agent-facing health: the same verdicts, as data ---------------------
+//
+// Everything above answers "should *this session* move off its model". That is not the
+// question an agent asks when it dispatches work: "which model is answering fastest *right
+// now*, and does it fit this task's context?". The old answer was a hardcoded rotation in
+// AGENTS.md (dsf → dsf2 → glm → qwen) plus `/speed pick`, a slash command an agent cannot
+// call, so the measured window only ever reached humans. This section exposes the same
+// verdicts as machine-readable data (one tool call, or one injected system-prompt line).
+
+export type HealthModel = {
+	id: string;
+	fullId: string;
+	ttftMs?: number;
+	/** Which prompt-size bucket the number came from. */
+	bucket: "small" | "large";
+	tokensPerSec?: number;
+	ageMs?: number;
+	/** `recent` = inside the recency cohort, `window` = older but fresh enough, `stale`/`none` = not rankable. */
+	source: Verdict["source"];
+	invalid: boolean;
+	failed: boolean;
+	contextWindow?: number;
+	fits: boolean;
+};
+
+export type HealthReport = {
+	asOf: number;
+	provider: string;
+	promptTokens: number;
+	needTokens: number;
+	virtual: { enabled: boolean; id: string; chain: string[]; minGainRatio: number };
+	models: HealthModel[];
+	/** Pure recency: fastest healthy model that fits, no capability preference. */
+	pick?: { id: string; fullId: string; ttftMs?: number; source: Verdict["source"] };
+	/** Chain preference, promoted only on a `virtual.minGainRatio` win. */
+	preferred?: string;
+	unknown: string[];
+	note: string;
+};
+
+export async function healthReport(
+	ctx: ExtensionContext,
+	options: { needTokens?: number; rank?: "recent" | "preferred"; fresh?: boolean } = {},
+): Promise<HealthReport> {
+	const cfg = virtualConfig;
+	const provider = cfg.enabled ? cfg.provider : (ctx.model?.provider ?? cfg.provider);
+	const promptTokens = promptTokensOf(ctx);
+	notePromptTokens(promptTokens);
+	const needTokens =
+		options.needTokens !== undefined && options.needTokens > 0
+			? options.needTokens
+			: Math.max(promptTokens, 0) + (provider === cfg.provider ? cfg.headroomTokens : config.contextGuard.headroomTokens);
+	// `fresh` re-reads the log: a tool call is rare, and a 1 MB tail parse is far cheaper than
+	// answering a dispatch question from a 30 s cache written before the pool degraded.
+	const stats = await recentStats(options.fresh === true);
+	const windows = new Map<string, number | undefined>();
+	for (const model of ctx.modelRegistry?.getAvailable?.() ?? []) {
+		if (model.provider !== provider || isVirtual(model)) continue;
+		windows.set(model.id, typeof model.contextWindow === "number" ? model.contextWindow : undefined);
+	}
+	const chain = routeChain().filter((id) => windows.size === 0 || windows.has(id));
+	const ids = chain.length ? chain : [...windows.keys()];
+	const now = Date.now();
+	const models: HealthModel[] = ids.map((id) => {
+		const stat = stats.get(`${provider}/${id}`);
+		const current = stat ? statVerdict(stat, needTokens, promptTokens) : undefined;
+		const broken = stat ? isBroken(stat) : { invalid: false, failed: false };
+		const contextWindow = windows.get(id);
+		return {
+			id,
+			fullId: `${provider}/${id}`,
+			ttftMs: current?.ttftMs,
+			bucket: current?.bucket ?? "small",
+			tokensPerSec: current?.tokensPerSec ?? stat?.tokensPerSec,
+			ageMs: current?.ageMs,
+			source: current?.source ?? "none",
+			invalid: broken.invalid,
+			// A model this session just watched send no first token is failed too, even before
+			// its probe error lands: that is the router's own vocabulary (`stalledUntil`).
+			failed: broken.failed || (stalledUntil.get(id) ?? 0) > now,
+			contextWindow,
+			fits: needTokens <= 0 || !contextWindow || contextWindow >= needTokens,
+		};
+	});
+	const healthy = models
+		.filter((model) => model.fits && !model.invalid && !model.failed && typeof model.ttftMs === "number")
+		.sort((a, b) => (a.ttftMs! - b.ttftMs!) || ((b.tokensPerSec ?? 0) - (a.tokensPerSec ?? 0)));
+	const best = healthy[0];
+	const preferred = chooseRoute({
+		candidates: models.map((model) => ({
+			id: model.id,
+			ttftMs: model.ttftMs,
+			invalid: model.invalid,
+			failed: model.failed,
+			contextWindow: model.contextWindow,
+			order: ids.indexOf(model.id),
+		})),
+		chain: ids,
+		needTokens,
+		reason: "user",
+		now,
+		quarantineMs: cfg.quarantineMs,
+		minGainRatio: cfg.minGainRatio,
+	})?.modelId;
+	const currentId = effectiveModelId(ctx);
+	const currentModel = models.find((model) => model.id === currentId);
+	const unknown = models.filter((model) => typeof model.ttftMs !== "number").map((model) => model.fullId);
+	const notes: string[] = [];
+	if (!cfg.enabled) notes.push("virtual model off; pass a fullId to the subagent model field");
+	if (currentModel && typeof currentModel.ttftMs === "number" && best && best.id !== currentId) {
+		notes.push(`current ${currentId} ${fmtMs(currentModel.ttftMs)} vs fastest ${best.id} ${fmtMs(best.ttftMs)}`);
+	}
+	if (sessionBound()) notes.push("session bound: leaving re-pays the prefix cache, so prefer staying");
+	return {
+		asOf: now,
+		provider,
+		promptTokens,
+		needTokens,
+		virtual: { enabled: cfg.enabled, id: cfg.id, chain: ids, minGainRatio: cfg.minGainRatio },
+		models,
+		pick: best ? { id: best.id, fullId: best.fullId, ttftMs: best.ttftMs, source: best.source } : undefined,
+		preferred: preferred ? `${provider}/${preferred}` : undefined,
+		unknown,
+		note: notes.join("; "),
+	};
+}
+
+/** One line of pool health for the system prompt: cheap, and only rewrites when it changes. */
+export function formatHealthLine(report: HealthReport): string {
+	const ranked = report.models
+		.filter((model) => typeof model.ttftMs === "number")
+		.sort((a, b) => a.ttftMs! - b.ttftMs!)
+		.slice(0, 5)
+		.map((model) => `${model.id} ${fmtMs(model.ttftMs)}${model.failed ? "!" : model.invalid ? "×" : ""}`);
+	const pick = report.pick ? `pick=${report.pick.fullId}` : `pick=none (${report.unknown.length} unknown)`;
+	const ctx = report.needTokens > 0 ? ` need≈${Math.round(report.needTokens / 1000)}k` : "";
+	return `[model-health] recent TTFT: ${ranked.join(" · ") || "no fresh samples"} | ${pick} | dispatch: ${report.provider}/<pick>${ctx}`;
+}
+
+/** Per-API registration guard: a reload hands in a fresh API object, a re-entrant call does not. */
+const healthToolRegistered = new WeakSet<object>();
+
+/**
+ * The pool's health as a tool.
+ *
+ * `/speed pick` answered this for a human at the keyboard, but a slash command is not
+ * callable by the agent — which is why dispatches kept using the hardcoded rotation in
+ * AGENTS.md even when the window said another model was answering in a third of the time.
+ * Read-only, no gateway traffic: it re-uses the rolling window the sampler already keeps.
+ */
+async function registerHealthTool(pi: ExtensionAPI) {
+	if (!pi || typeof pi !== "object" || healthToolRegistered.has(pi as object)) return;
+	if (typeof (pi as { registerTool?: unknown }).registerTool !== "function") return;
+	healthToolRegistered.add(pi as object);
+	// `typebox` is host-provided (docs/extensions.md, host module list). The fallback matters
+	// only for plain `node --test`, which imports this file with no node_modules on the path:
+	// a JSON Schema beats a load-time crash.
+	let parameters: unknown;
+	try {
+		const { Type } = await import("typebox");
+		parameters = Type.Object({
+			rank: Type.Optional(Type.Union([Type.Literal("recent"), Type.Literal("preferred")])),
+			needTokens: Type.Optional(Type.Number()),
+		});
+	} catch {
+		parameters = {
+			type: "object",
+			properties: {
+				rank: { type: "string", enum: ["recent", "preferred"], description: "'recent' (default) = fastest answer now; 'preferred' = chain order, promoted only on a clear win" },
+				needTokens: { type: "number", description: "Context this work needs; models whose window is smaller are reported as no-fit" },
+			},
+			additionalProperties: false,
+		};
+	}
+	pi.registerTool({
+		name: "model_health",
+		label: "Model Health",
+		description:
+			"Measured latency of the model pool right now: per-model recent TTFT / tokens-per-second with freshness, content health and context fit, plus the model a dispatch should use. Read-only, no gateway traffic.",
+		promptSnippet: "Measured recent TTFT and health of the model pool, plus which model to dispatch on",
+		promptGuidelines: [
+			"Use model_health before dispatching subagents or naming a model explicitly: prefer its rank='recent' pick over a hardcoded rotation order.",
+			"Use model_health with rank='preferred' when capability order should win over raw latency (long-context or review work).",
+			"If model_health reports every model stale or unknown, keep the current model instead of switching on a guess.",
+		],
+		parameters: parameters as never,
+		async execute(_toolCallId: string, params: unknown, _signal: unknown, _onUpdate: unknown, toolCtx: ExtensionContext) {
+			const input = (params ?? {}) as { rank?: string; needTokens?: number };
+			const rank = input.rank === "preferred" ? "preferred" : "recent";
+			const ctx = toolCtx ?? (liveCtx as ExtensionContext);
+			const report = await healthReport(ctx, { rank, needTokens: input.needTokens, fresh: true });
+			const chosen = rank === "preferred" ? report.preferred : report.pick?.fullId;
+			const chosenId = chosen ? chosen.split("/").pop() : undefined;
+			// Log the decision with the evidence that produced it: without this line, "the pick was
+			// right" is unfalsifiable — the same reason the 2026-11-24 slow pool looked healthy.
+			await appendLog({
+				kind: "pick",
+				rank,
+				pick: chosen,
+				promptTokens: report.promptTokens,
+				needTokens: report.needTokens,
+				models: report.models.map(
+					(model) => `${model.id}=${model.ttftMs === undefined ? "?" : Math.round(model.ttftMs)}/${model.source}${model.failed ? "!" : ""}${model.invalid ? "x" : ""}`,
+				),
+			});
+			const lines = [
+				`${report.provider} · need≈${Math.round(report.needTokens / 1000)}k · prompt≈${Math.round(report.promptTokens / 1000)}k · chain ${report.virtual.chain.join(" → ")}${report.virtual.enabled ? " (virtual on)" : ""}`,
+				...report.models.map(
+					(model) =>
+						`${model.id === chosenId ? "*" : " "} ${model.fullId}: ${fmtMs(model.ttftMs)}${model.tokensPerSec ? ` · ${Math.round(model.tokensPerSec)} tok/s` : ""} [${model.source}${model.failed ? " failed" : ""}${model.invalid ? " bad-content" : ""}${model.fits ? "" : ` no-fit ${model.contextWindow}`}${model.ageMs !== undefined ? ` ${fmtAgeSpan(model.ageMs)}` : ""}]`,
+				),
+				`pick(${rank}) = ${chosen ?? "none"}`,
+				...(report.note ? [`note: ${report.note}`] : []),
+			];
+			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: report as unknown as Record<string, unknown> };
+		},
+	});
+}
 
 /**
  * A session is *bound* when leaving it costs more than the slowdown: the prefix cache
@@ -1485,7 +1764,7 @@ function runProbe(): Promise<string> {
 	});
 }
 
-export default function modelSpeed(pi: ExtensionAPI) {
+export default async function modelSpeed(pi: ExtensionAPI): Promise<void> {
 	// The watchdog runs from a timer, outside every hook closure, so it needs the API too.
 	liveApi = pi;
 	// Load config immediately so pre-session events already see it; session_start reloads it.
@@ -1493,6 +1772,10 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	// config read resolves (a child's first request beat it and sent `ustc-auto` upstream).
 	virtualConfig = readVirtualConfigSync();
 	registerAutoRouter(pi);
+	// Awaited, unlike the config read: a tool that appears one microtask late is fine, but
+	// `model_health` is what the first dispatch of a run consults, and Pi has already promised
+	// the extension is loaded when this returns.
+	await registerHealthTool(pi);
 	void loadConfig().then((loaded) => {
 		config = loaded;
 		virtualConfig = loaded.virtual;
@@ -1509,6 +1792,21 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		lastActivityAt = Date.now();
 		// A real turn beats a synthetic sample: the gateway is one queue and the user is waiting.
 		samplerAbort?.abort();
+		// A request that never reached `message_end` (aborted turn, watchdog park) is not in
+		// flight any more: Pi serialises provider requests inside one session, so anything that
+		// survived a whole stall window is an orphan. Dropping it keeps the pairing below honest.
+		const orphanCutoff = Date.now() - Math.max(config.thresholds.stallMs * 2, 300_000);
+		const orphans = pending.filter((entry) => entry.startedAt < orphanCutoff);
+		if (orphans.length > 0) {
+			pending = pending.filter((entry) => entry.startedAt >= orphanCutoff);
+			void appendLog({ kind: "orphan", count: orphans.length, models: orphans.map((entry) => entry.model) });
+		}
+		// Cheap, and it is the only place the bucket sees the prompt before the response.
+		try {
+			notePromptTokens(Number(ctx.getContextUsage?.()?.tokens ?? 0));
+		} catch {
+			/* not every mode exposes it */
+		}
 		pending.push({ model: effectiveModelId(ctx), provider: ctx.model?.provider ?? "", startedAt: Date.now() });
 		if (pending.length > 8) pending.shift();
 		// Arm the stall watchdog: if no token arrives, `turn_end` never fires and nothing else
@@ -1548,7 +1846,11 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const message = (event as any).message;
 		if (message?.role !== "assistant") return;
 		clearStall();
-		const sample = pending.shift();
+		// Pair with the *newest* in-flight request — the same one `message_update` and
+		// `after_provider_response` read. `shift()` here and `pending[length-1]` there meant that
+		// after one request ended without a `message_end`, every later TTFT was attached to the
+		// previous request's start time (audit, 2026-11-27).
+		const sample = pending.pop();
 		if (!sample) return;
 		sample.endedAt = Date.now();
 		lastActivityAt = sample.endedAt;
@@ -1767,6 +2069,29 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		}
 	});
 
+	// ---- agent awareness --------------------------------------------------
+	// A human reads `/speed`; an agent does not. One line in the system prompt is enough to
+	// stop dispatches from using a rotation the rolling window already contradicts. Pi diffs
+	// prompt sections against what the model already has, so an unchanged line costs nothing
+	// (no extra system message, no cache miss); it is only re-sent when the pool changes.
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (process.env.PI_MODEL_SPEED === "0" || PINNED_CHILD) return;
+		try {
+			const report = await healthReport(ctx, { rank: "recent" });
+			if (!report.models.some((model) => typeof model.ttftMs === "number")) return;
+			const line = formatHealthLine(report);
+			const options = event.systemPromptOptions as
+				| { sections?: Record<string, string> | Map<string, string> }
+				| undefined;
+			const sections = options?.sections;
+			if (sections instanceof Map) sections.set("model-health", line);
+			else if (sections && typeof sections === "object") sections["model-health"] = line;
+			else if (options) (options as { sections?: Record<string, string> }).sections = { "model-health": line };
+		} catch {
+			/* awareness must never break a turn */
+		}
+	});
+
 	// ---- commands ---------------------------------------------------------
 	/** How long the `/speed` table stays on screen before clearing itself. */
 	const SPEED_WIDGET_TTL_MS = 20_000;
@@ -1816,6 +2141,7 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		const list = sortedVerdicts(stats, {
 			now: Date.now(),
 			largePromptTokens: config.thresholds.largePromptTokens,
+			promptTokens: promptTokensNow,
 			staleMs: config.stats.staleMs,
 		})
 			.map((entry) => entry.stat)
@@ -1824,7 +2150,6 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				if (mine !== 0) return mine;
 				return (statVerdict(a, 0).ttftMs ?? Number.POSITIVE_INFINITY) - (statVerdict(b, 0).ttftMs ?? Number.POSITIVE_INFINITY);
 			});
-		const windowH = Math.round(config.stats.windowMs / 360_000) / 10;
 		return list.map((stat) => `${stat.provider === currentProvider ? "*" : " "} ${stat.model}: ${fmtStat(stat)}`);
 	};
 

@@ -135,12 +135,45 @@ test("a fresh failure disqualifies a model that used to be fast", () => {
 	assert.equal(current.ttftMs, undefined);
 });
 
-test("the verdict reads the prompt-size bucket the session will use", () => {
-	const stick = aggregate(recentRecords([line(sample({ ttftMs: 1_000, promptTokens: 1_000 })), line(sample({ ttftMs: 18_000, promptTokens: 200_000 }))], opts), opts).get(
-		"custom.ustc-pool/ustc-dsf2",
-	);
+// Audit 2026-11-27: a 500 ms answer ten minutes ago plus a timeout one minute ago used to
+// rank as "recent 500 ms" while `isBroken().failed` said the model had failed. Ordering by
+// which evidence is *newest* fixes both directions without a manual reset.
+test("a failure only disqualifies while it is the newest evidence", () => {
+	const recency = { ...opts, recentMs: 1_800_000 };
+	const timeout = {
+		kind: "probe",
+		model: "ustc-dsf2",
+		provider: "custom.ustc-pool",
+		startedAt: now - 60_000,
+		endedAt: now - 60_000,
+		error: "timeout",
+	};
+	const good = (endedAt) => sample({ ttftMs: 500, endedAt, startedAt: endedAt - 2_000 });
+
+	const afterFailure = aggregate(recentRecords([line(good(now - 600_000)), line(timeout)], recency), recency).get("custom.ustc-pool/ustc-dsf2");
+	assert.equal(afterFailure.errorLastAt, now - 60_000);
+	assert.equal(afterFailure.answerLastAt, now - 600_000);
+	assert.equal(verdict(afterFailure, { now, largePromptTokens: 30_000, staleMs: 3_600_000 }).source, "stale", "the timeout is newer than the answer");
+	assert.equal(verdict(afterFailure, { now, largePromptTokens: 30_000, staleMs: 3_600_000 }).ttftMs, undefined);
+
+	const recovered = aggregate(recentRecords([line(timeout), line(good(now - 10_000))], recency), recency).get("custom.ustc-pool/ustc-dsf2");
+	const fresh = verdict(recovered, { now, largePromptTokens: 30_000, staleMs: 3_600_000 });
+	assert.equal(fresh.source, "recent", "one answer after the failure clears it");
+	assert.equal(fresh.ttftMs, 500);
+});
+
+test("the bucket follows the prompt, not the context guard's headroom", () => {
+	const stick = aggregate(
+		recentRecords([line(sample({ ttftMs: 1_000, promptTokens: 1_000 })), line(sample({ ttftMs: 18_000, promptTokens: 200_000 }))], opts),
+		opts,
+	).get("custom.ustc-pool/ustc-dsf2");
 	assert.equal(verdict(stick, { now, largePromptTokens: 30_000, needTokens: 2_000 }).ttftMs, 1_000);
 	assert.equal(verdict(stick, { now, largePromptTokens: 30_000, needTokens: 200_000 }).ttftMs, 18_000);
+	// A 5 k prompt plus a 48 k reply/context headroom is still a small prompt: the guard number
+	// must not switch the reading to the large-context median.
+	assert.equal(verdict(stick, { now, largePromptTokens: 30_000, needTokens: 53_000, promptTokens: 5_000 }).ttftMs, 1_000);
+	assert.equal(verdict(stick, { now, largePromptTokens: 30_000, needTokens: 53_000, promptTokens: 5_000 }).bucket, "small");
+	assert.equal(verdict(stick, { now, largePromptTokens: 30_000, needTokens: 250_000, promptTokens: 200_000 }).bucket, "large");
 });
 
 test("sorted verdicts put fresh fast models first and unknown models last", () => {
