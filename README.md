@@ -59,6 +59,10 @@ npm run pack:dry   # check what each package would publish
 npm run smoke      # patch-set + parser self-checks, no network
 ```
 
+`scripts/pack-check.mjs` 是 `pack:dry` 的实现：对每个 package 跑 `npm pack --dry-run --json`，
+断言 ①文件清单/内容里没有敏感路径与密钥 ②必需文件都在 tarball 里 ③package 没有运行时
+`dependencies`；任一不符即非 0 退出。
+
 ## License
 
 MIT

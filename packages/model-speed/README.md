@@ -15,7 +15,7 @@ Two details that make the numbers trustworthy rather than decorative:
 - The anchor is `before_provider_request`, not `message_start`. `message_start` fires after the response headers, so counting from it reports a TTFT of ~0 for every request.
 - Timings are queued, so overlapping requests (retries, nested calls, compaction) do not clobber each other.
 
-Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl` (every line carries the `session` it belongs to), and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed-stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
+Samples are appended to `~/.cache/pi-model-speed/speed-log.jsonl` (every line carries the `session` it belongs to), and the tail of that log is aggregated into a **rolling window** (`stats.ts`): per model, median TTFT for small and large prompts, median and mean token generation speed, sample counts, errors and the age of the newest sample. `/speed` and `/speed stats` read the window; it is also written to `~/.cache/pi-model-speed/stats.json` for scripts.
 
 **A six-hour median is not a verdict.** With sparse sampling — long idle gaps between sessions — a fresh 10.2 s measurement used to lose against four 1.3 s measurements from hours earlier, so the model that had just gone slow still ranked as the fast one (`model-big`, 2026-11-24: window median 1.4 s, newest probe 10.2 s, ranked second-fastest). The window keeps those medians for context, but everything that *decides* something reads a verdict over the **recency cohort** (`stats.recentMs`, default = one `sampling.intervalMs`):
 
@@ -35,7 +35,7 @@ The external probe file has the same rule via `probe.maxAgeMs`: past that age it
 - a lease file plus the idle check, so two open sessions never double the spend;
 - a real turn aborts in-flight samples, because the user's latency beats a background measurement.
 
-This replaces the old "run a probe script when you remember to" flow. An external probe file is still accepted (and `/speed-probe --external` refreshes it) for legacy cron setups, but it is now the *fallback* ranking source.
+This replaces the old "run a probe script when you remember to" flow. An external probe file is still accepted (and `/speed probe --external` refreshes it) for legacy cron setups, but it is now the *fallback* ranking source.
 
 **Slow-streak failover.** If the current model is slow — TTFT over the threshold, TPOT over the threshold, or a turn whose wall clock exceeded `turnWallMs` (bucketed by prompt size) — for `window` of the last turns, the extension switches to the fastest **other model of the same provider**. It never crosses providers, because that changes pricing and capabilities behind your back.
 
@@ -50,7 +50,7 @@ The timer is cleared on the first payload delta and at `message_end`/`turn_end`,
 
 Guards: once per `cooldownMs`, at most once per session, skipped while a manual `/model` is driving, the target must **clearly** be faster (`minImprovementRatio` / `minImprovementMs`) — a 13 s → 12 s "win" is not worth re-billing the prompt — and the target must **fit the session's context** (see below).
 
-**A session remembers what it already did.** The budget, the model the last automatic switch landed on, and the models this conversation abandoned are per session and persisted to `switch-state.json` (`sessions.<key>`), keyed by the session file name. Reload, `--resume` and fork restore them — plus this session's timed samples from the log — so a resumed conversation does not get a fresh budget and does not step back onto the model it just left. A *manual* `/model` still resets the budget (`model_select` with a model that is not ours); `/new` starts a conversation with no inherited memory, `/speed-stats` shows what was remembered.
+**A session remembers what it already did.** The budget, the model the last automatic switch landed on, and the models this conversation abandoned are per session and persisted to `switch-state.json` (`sessions.<key>`), keyed by the session file name. Reload, `--resume` and fork restore them — plus this session's timed samples from the log — so a resumed conversation does not get a fresh budget and does not step back onto the model it just left. A *manual* `/model` still resets the budget (`model_select` with a model that is not ours); `/new` starts a conversation with no inherited memory, `/speed stats` shows what was remembered.
 
 **Fast is not the same as usable.** A provider often mixes windows: a fast 256k model next to a slow 1M one. Letting speed alone pick the target hands a 300k-token session the 256k model, and the turn dies on a `400 ContextWindowExceededError` (inside a Fabric child, the whole run dies). Targets whose declared `contextWindow` is below the session's current tokens (from `getContextUsage()` and the largest prompt this session has already sent) plus `contextGuard.headroomTokens` are skipped, and both the switch notification and `/speed` say so.
 
@@ -78,12 +78,15 @@ Restart Pi (or `/reload`).
 
 | Command | Effect |
 | --- | --- |
-| `/speed` | Rolling window of recent TTFT / tokens-per-second per model, plus the ranked candidates; refreshes stale models in the background |
-| `/speed-probe` | Sample the stale pool models now (background); `/speed-probe --force` ignores freshness; `/speed-probe <model…>` samples exactly those; `--external` runs the legacy probe script |
-| `/speed-stats` | This session's TTFT/TPOT medians, the remembered switch budget, and the rolling recent window |
-| `/speed-auto on\|off` | Toggle failover for this session |
-| `/speed-router` | The `auto` virtual model: chain, per-model health, and the model it would pick now |
-| `/speed-pick` | Print the provider-qualified model the router would use now — use it when dispatching a subagent |
+| `/speed` | Rolling window of recent TTFT / tokens-per-second per model, plus the ranked candidates; refreshes stale models in the background. Renders as a **temporary** widget below the editor, auto-closes after 20 s |
+| `/speed close` | Dismiss the table widget immediately |
+| `/speed probe [--force] [<model…>] [--external]` | Sample the stale pool models now (background); `--force` ignores freshness; model ids sample exactly those; `--external` runs the legacy probe script |
+| `/speed stats` | This session's TTFT/TPOT medians, the remembered switch budget, and the rolling recent window |
+| `/speed auto on\|off` | Toggle failover for this session |
+| `/speed router` | The `auto` virtual model: chain, per-model health, and the model it would pick now |
+| `/speed pick [retry]` | Print the provider-qualified model the router would use now — use it when dispatching a subagent |
+
+Autocomplete (`getArgumentCompletions`) offers the subcommands and their arguments, so `/speed ` + Tab lists them. The former `/speed-probe`, `/speed-stats`, `/speed-auto`, `/speed-router`, `/speed-pick` commands were **removed** — five extra entries in the slash-command list for what one argument does.
 
 ## Configuration
 
@@ -177,7 +180,7 @@ Optional file `~/.pi/agent/model-speed.json`:
 | `stats.windowMs` | `21600000` | Rolling window used for the medians in `/speed` and `stats.json` (6 h) (`PI_MODEL_SPEED_STATS_WINDOW_MS`) |
 | `stats.recentMs` | = `sampling.intervalMs` | Recency cohort that decides the verdict ranking uses (`PI_MODEL_SPEED_RECENT_MS`; `0` = always use the whole window) |
 | `stats.staleMs` | = 2 × `stats.recentMs` | No measurement newer than this means the model is *unknown*, never "fast" (`PI_MODEL_SPEED_STALE_MS`) |
-| `probe.command` | — | Legacy external probe, only run by `/speed-probe --external` |
+| `probe.command` | — | Legacy external probe, only run by `/speed probe --external` |
 | `probe.file` | — | That probe's output: `{ "ts": 1700000000, "models": { "<id>": { "ok": true, "ttft": 1.2 } } }` (`ttft` in seconds) |
 | `probe.maxAgeMs` | `3600000` | A probe file older than this is shown but not ranked (`PI_MODEL_SPEED_PROBE_MAX_AGE_MS`) |
 
@@ -222,7 +225,7 @@ That last rule is the one a stopwatch cannot express. deepseek-flash-2 answered 
 - give the child this extension explicitly (works for foreground and background children):
   `~/.pi/agent/settings.json` → `"subagents": { "defaultSubagentOnlyExtensions": ["<path>/packages/model-speed/extensions/index.ts"] }`,
   then `"defaultModel": "my-gateway/auto"` resolves inside the child, the request is routed to a physical model, and pi-subagents' model verification still passes (it compares the *virtual selection*, which never changes). Verified end to end with an `async` scout launched on `auto:minimal`;
-- or keep children on a physical model and pick it with `/speed-pick` / from `/speed-router` health.  The recommended setup is: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `/speed-pick` instead of guessing, or dispatch a background lane on the virtual one.
+- or keep children on a physical model and pick it with `/speed pick` / from `/speed router` health.  The recommended setup is: the interactive session on the virtual model, subagents on an explicit physical model — pick it with `/speed pick` instead of guessing, or dispatch a background lane on the virtual one.
 
 `PI_MODEL_SPEED_SAMPLING_ALLOW_CHILD=1` re-enables pool sampling inside a pinned child (off by default: a worker on one model only adds gateway load beside the parent's samples).
 
