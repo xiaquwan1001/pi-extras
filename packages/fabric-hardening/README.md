@@ -2,7 +2,7 @@
 
 Runtime hardening for [pi-fabric](https://github.com/fabric-runtime/pi-fabric) (and [pi-fold](https://pi.dev/packages/pi-fold)), as an extension instead of a fork.
 
-> **现状（2026-11-21）**：pi-fabric 已本机卸载，下面的 pi-fabric 补丁全部**静默跳过**（package absent → `skipped: missing`）。这个包仍装着是因为它还有 4 条活补丁：`pi-fold` 的 evidence-no-session-guard，`@llblab/pi-grow-loop` 的 state-visible / state-guideline（以及按 `PI_SUBAGENT_CHILD` 拦截子代理续轮的职责——那一条现由 `~/.pi/agent/extensions/pi-loop-switch.ts` 负责，本包的 child-guard 只看 `PI_FABRIC_*`，对 pi-subagents 子进程不生效）。fabric 卸后本包的 `tmpdir.ts`（TMPDIR 迁出小 tmpfs）也不再需要，但无害。
+> **现状（2026-11-27）**：pi-fabric 已本机卸载，下面的 pi-fabric 补丁全部**静默跳过**（package absent → `skipped: missing`）。这个包仍装着是因为它还有 3 条活补丁（见下表）：`pi-fold` 的 evidence-no-session-guard 等。**针对 `@llblab/pi-grow-loop` 的 3 条补丁已于 2026-11-27 删除**——该包已卸载，续轮改由我们自己的 `pi-loop-core`（子代理拦截、可见状态都在扩展内部实现）。fabric 卸后本包的 `tmpdir.ts`（TMPDIR 迁出小 tmpfs）也不再需要，但无害。
 
 ## Why this exists
 
@@ -30,8 +30,6 @@ Every fix here comes from a real incident where Fabric's failure mode was worse 
 | `error-ordering` | pi-fabric | "was killed by SIGSEGV" comes first, `stderr` becomes `; last stderr: …` |
 | `tolerate-same-provider-model-drift` | pi-fabric | a child served by another model of the **same** provider logs the drift and keeps running; another *provider*, or a missing attribution, is still fatal |
 | `evidence-no-session-guard` | pi-fold | skip evidence archiving when there is no session file instead of throwing |
-| `grow-loop-child-guard` | @llblab/pi-grow-loop | `grow_loop` refuses inside a Fabric child (`PI_FABRIC_DEPTH>=1`); a looping child never reaches a terminal state the parent can see, so `agents.wait` blocked to timeout |
-| `grow-loop-state-visible` | @llblab/pi-grow-loop | the tool result says `⟳ 续轮 #N` instead of an ambiguous "scheduled" sentence |
 
 Plus one patch-free fix: **TMPDIR relocation**. When `/tmp` is a tmpfs with less than `PI_FABRIC_TMPDIR_MIN_FREE_MB` (default 4096) MB free, `TMPDIR` is pointed at `~/.cache/pi-tmp` before Fabric creates its run roots. A real disk is left alone.
 

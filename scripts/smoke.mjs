@@ -227,34 +227,6 @@ writeFileSync(
 	].join("\n"),
 );
 
-const growDist = join(npmDir, "@llblab", "pi-grow-loop", "dist");
-mkdirSync(growDist, { recursive: true });
-writeFileSync(
-	join(npmDir, "@llblab", "pi-grow-loop", "package.json"),
-	JSON.stringify({ name: "@llblab/pi-grow-loop", type: "module" }),
-);
-// Upstream text of the grow-loop patches: the tool's execute prologue, the two
-// checkpoint sentences, and the stop guideline line.
-writeFileSync(
-	join(growDist, "index.js"),
-	[
-		"class GrowLoop {",
-		"        async execute(_toolCallId, params, _signal, _onUpdate, ctx) {",
-		"            lastCtx = ctx;",
-		"        return { lastCtx };",
-		"    }",
-		"}",
-		"const guideline = [",
-		'            "To stop, do not call grow_loop; finish with a concise stop proof.",',
-		"];",
-		"const checkpoint = [already",
-		'                            ? `\\nTool grow_loop was already called this turn. Iteration #${nextIteration} remains scheduled; delay updated to ${delayMs / 1000}s`',
-		'                            : `\\nGrow Loop iteration #${nextIteration} deferred until idle, then scheduled after ${delayMs / 1000}s delay`,',
-		"];",
-		"export { GrowLoop, guideline, checkpoint };",
-	].join("\n"),
-);
-
 const first = applyPatches({ npmDir });
 const second = applyPatches({ npmDir });
 
