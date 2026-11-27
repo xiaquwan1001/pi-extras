@@ -32,7 +32,6 @@ Every fix here comes from a real incident where Fabric's failure mode was worse 
 | `evidence-no-session-guard` | pi-fold | skip evidence archiving when there is no session file instead of throwing |
 | `grow-loop-child-guard` | @llblab/pi-grow-loop | `grow_loop` refuses inside a Fabric child (`PI_FABRIC_DEPTH>=1`); a looping child never reaches a terminal state the parent can see, so `agents.wait` blocked to timeout |
 | `grow-loop-state-visible` | @llblab/pi-grow-loop | the tool result says `⟳ 续轮 #N` instead of an ambiguous "scheduled" sentence |
-| `grow-loop-state-guideline` | @llblab/pi-grow-loop | the prompt guideline requires an explicit `⟳ 续轮` / `■ 结束` marker |
 
 Plus one patch-free fix: **TMPDIR relocation**. When `/tmp` is a tmpfs with less than `PI_FABRIC_TMPDIR_MIN_FREE_MB` (default 4096) MB free, `TMPDIR` is pointed at `~/.cache/pi-tmp` before Fabric creates its run roots. A real disk is left alone.
 

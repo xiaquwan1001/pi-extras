@@ -242,18 +242,7 @@ export const PATCHES: Patch[] = [
 			'                            : `⟳ grow-loop 续轮 #${nextIteration}（本轮不是最终完成；${delayMs / 1000}s 后继续）`,',
 		].join("\n"),
 	},
-	{
-		id: "grow-loop-state-guideline",
-		packageName: "@llblab/pi-grow-loop",
-		roots: ["dist"],
-		marker: "[pi-fabric-hardening:grow-loop-state-guideline]",
-		label: "pi-grow-loop: prompt guideline demands an explicit ⟳ 续轮 / ■ 结束 marker",
-		original: '            "To stop, do not call grow_loop; finish with a concise stop proof.",',
-		patched: [
-			'            "To stop, do not call grow_loop; finish with a concise stop proof.",',
-			'            "Always state the loop state explicitly in your final message for the turn: `⟳ 续轮 #N（Ns 后继续）` when you scheduled one, `■ 结束` when you stopped. Never leave continuation implicit — a checkpoint that will continue looks identical to a finished task otherwise.", // [pi-fabric-hardening:grow-loop-state-guideline]',
-		].join("\n"),
-	},
+
 ];
 
 const MAX_PATCHABLE_FILE_BYTES = 8 * 1024 * 1024;
