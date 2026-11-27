@@ -274,7 +274,7 @@ rmSync(root, { recursive: true, force: true });
 
 // -------------------------------------------------------------- model-speed
 // A Fabric child that switches model is terminated by the parent's model admission,
-// so the extension must refuse the switch even when /speed-auto asks for it.
+// so the extension must refuse the switch even when `/speed auto on` asks for it.
 {
 	const name = "model-speed: a Fabric child cannot switch models";
 	const previous = process.env.PI_FABRIC_LINEAGE;
@@ -284,9 +284,9 @@ rmSync(root, { recursive: true, force: true });
 		const commands = new Map();
 		const notices = [];
 		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
-		const command = commands.get("speed-auto");
-		assert.ok(command, "/speed-auto is registered");
-		await command.handler("on", { ui: { notify: (message) => notices.push(message) } });
+		const command = commands.get("speed");
+		assert.ok(command, "/speed is registered");
+		await command.handler("auto on", { ui: { notify: (message) => notices.push(message) } });
 		assert.match(notices.at(-1) ?? "", /pinned off/);
 		passed.push(name);
 	} catch (error) {
@@ -306,7 +306,7 @@ check("model-speed: a pi-subagents child cannot switch models", () => {
 		const commands = new Map();
 		const notices = [];
 		modelSpeed.default({ on: () => {}, registerCommand: (id, definition) => commands.set(id, definition), registerVirtualModel: () => {} });
-		await commands.get("speed-auto").handler("on", { ui: { notify: (m) => notices.push(m) } });
+		await commands.get("speed").handler("auto on", { ui: { notify: (m) => notices.push(m) } });
 		process.stdout.write(notices.at(-1) ?? "");
 	`;
 	const env = { ...process.env, PI_SUBAGENT_CHILD: "1" };

@@ -65,7 +65,18 @@
  * below the session's current tokens plus `contextGuard.headroomTokens` are skipped
  * and reported as such.
  *
- * Commands: `/speed` (table + optional probe run), `/speed-stats`, `/speed on|off`.
+ * Commands: exactly one — `/speed` with subcommands (values, not extra command names):
+ * `/speed` (table), `/speed close`, `/speed stats`, `/speed probe [--force] [--external]
+ * [model …]`, `/speed router`, `/speed pick [retry]`, `/speed auto [on|off]`.
+ * Subcommands are autocompleted through `getArgumentCompletions` (values are the whole
+ * argument string, so the editor keeps the text the next level needs). The old
+ * `/speed-probe|stats|router|pick|auto` commands are gone: five near-duplicate entries in
+ * the slash-command list bought nothing that one argument does not.
+ *
+ * The `/speed` table is a *temporary* widget: it renders below the editor and clears itself
+ * after `SPEED_WIDGET_TTL_MS` (or immediately via `/speed close`). A persistent widget
+ * occupied the editor for the rest of the session (2026-11-26 user report), which is why
+ * every table view now goes through `showWidgetTemporarily()`.
  *
  * Config: `~/.pi/agent/model-speed.json` (all fields optional)
  * {
@@ -1757,6 +1768,33 @@ export default function modelSpeed(pi: ExtensionAPI) {
 	});
 
 	// ---- commands ---------------------------------------------------------
+	/** How long the `/speed` table stays on screen before clearing itself. */
+	const SPEED_WIDGET_TTL_MS = 20_000;
+	let widgetClearTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Render below the editor, then get out of the way: a widget that stays forever took
+	 *  over the editor until the next `/speed` (2026-11-26 user report). */
+	function showWidgetTemporarily(ctx: ExtensionContext, lines: string[], ttlMs = SPEED_WIDGET_TTL_MS) {
+		ctx.ui.setWidget("model-speed", lines, { placement: "belowEditor" });
+		if (widgetClearTimer !== undefined) clearTimeout(widgetClearTimer);
+		widgetClearTimer = setTimeout(() => {
+			widgetClearTimer = undefined;
+			try {
+				ctx.ui.setWidget("model-speed", undefined);
+			} catch {
+				/* widget may already be gone with the session */
+			}
+		}, ttlMs);
+		(widgetClearTimer as { unref?: () => void }).unref?.();
+	}
+
+	function closeWidget(ctx: ExtensionContext) {
+		if (widgetClearTimer !== undefined) {
+			clearTimeout(widgetClearTimer);
+			widgetClearTimer = undefined;
+		}
+		ctx.ui.setWidget("model-speed", undefined);
+	}
+
 	const renderRanking = async (ctx: ExtensionContext) => {
 		const ranking = await rankCandidates(ctx);
 		const currentId = ctx.model?.id;
@@ -1767,9 +1805,6 @@ export default function modelSpeed(pi: ExtensionAPI) {
 		for (const entry of ranking.excluded) {
 			lines.push(`  ${entry.id}: skipped, context window ${entry.contextWindow} < session ${ranking.needTokens} tokens`);
 		}
-		ctx.ui.setWidget("model-speed", [`same-provider candidates (fastest first):`, ...lines.map((line) => `  ${line}`)], {
-			placement: "belowEditor",
-		});
 		return lines;
 	};
 
@@ -1790,215 +1825,313 @@ export default function modelSpeed(pi: ExtensionAPI) {
 				return (statVerdict(a, 0).ttftMs ?? Number.POSITIVE_INFINITY) - (statVerdict(b, 0).ttftMs ?? Number.POSITIVE_INFINITY);
 			});
 		const windowH = Math.round(config.stats.windowMs / 360_000) / 10;
-		const lines = list.map((stat) => `${stat.provider === currentProvider ? "*" : " "} ${stat.model}: ${fmtStat(stat)}`);
-		ctx.ui.setWidget("model-speed", [`recent ${windowH}h (fastest first):`, ...lines.map((line) => `  ${line}`)], {
-			placement: "belowEditor",
-		});
-		return lines;
+		return list.map((stat) => `${stat.provider === currentProvider ? "*" : " "} ${stat.model}: ${fmtStat(stat)}`);
 	};
 
-	pi.registerCommand("speed", {
-		description: "Show recent measured TTFT / tokens-per-second per model (rolling window), and rank candidates",
-		handler: async (_args, ctx) => {
-			const lines = await renderRecent(ctx);
+	async function speedStatsHandler(ctx: ExtensionContext) {
+		const recent = await renderRecent(ctx);
+		const session: string[] = [];
+		if (samples.length > 0) {
+			const byModel = new Map<string, Sample[]>();
+			const seen = new Set<number>();
+			for (const sample of samples) {
+				if (seen.has(sample.startedAt)) continue; // two extension instances can record the same call
+				seen.add(sample.startedAt);
+				const key = sample.model || "?";
+				byModel.set(key, [...(byModel.get(key) ?? []), sample]);
+			}
+			session.push(...[...byModel].map(([model, list]) => {
+				const ttft = list.map((s) => s.ttftMs).filter((v): v is number => typeof v === "number");
+				const tps = list
+					.map((s) => (typeof s.tpotMs === "number" && s.tpotMs > 0 ? 1000 / s.tpotMs : undefined))
+					.filter((v): v is number => typeof v === "number");
+				return `${model}: n=${list.length} TTFT median=${fmtMs(ttft.length ? median(ttft) : undefined)} ${tps.length ? `${Math.round(median(tps))} tok/s` : "—"}`;
+			}));
+		}
+		ctx.ui.notify(`[model-speed] ${[...recent, ...session].join(" | ") || "no samples yet"}`, "info");
+		const memory = (await readSwitchState()).sessions?.[sessionKey];
+		if (memory && (memory.switches > 0 || memory.target)) {
 			ctx.ui.notify(
-				lines.length ? `[model-speed] recent: ${lines.join(" | ")}` : "[model-speed] no samples in the recent window yet — /speed-probe to take some now",
+				`[model-speed] this session already used ${memory.switches}/${config.maxSwitchesPerSession} switch(es)` +
+					(memory.target ? `, now on ${memory.target}` : "") +
+					` — remembered across reload/resume (${fmtAgeSpan(memory.updatedAt ? Date.now() - memory.updatedAt : undefined)})`,
 				"info",
 			);
-			const ranked = await renderRanking(ctx);
-			if (ranked.length) ctx.ui.notify(`[model-speed] candidates: ${ranked.join(" | ")}`, "info");
-			// `/speed` is now history-first: refresh in the background instead of blocking the TUI
-			// on a synchronous probe.
-			void maybeSample(ctx, { why: "speed" }).catch(() => undefined);
-		},
-	});
+		}
+	}
 
-	pi.registerCommand("speed-router", {
-		description: "Show the ustc-auto virtual model: its chain, per-model health, and what it would pick",
-		handler: async (_args, ctx) => {
-			const cfg = virtualConfig;
-			if (!cfg.enabled) {
-				ctx.ui.notify("[model-speed] virtual model is off (`virtual.enabled` in ~/.pi/agent/model-speed.json)", "info");
-				return;
-			}
-			const stats = await recentStats();
-			// Same rule as route(): live usage wins, the character estimate is the floor for a
-			// resumed session before the first response. With an empty estimate this command would
-			// advertise the 256k model as pickable for a 300k-token session and the next request
-			// would fail on it.
-			const needTokens = Math.max(Number(ctx.getContextUsage?.()?.tokens ?? 0), estimateNeedTokens([], 0)) + cfg.headroomTokens;
-			const registry = (sessionCtx?.modelRegistry ?? liveCtx?.modelRegistry) as never;
-			const lines = routeCandidates(registry).map((candidate) => {
-				const stat = stats.get(`${cfg.provider}/${candidate.id}`);
-				const broken = isBroken(stat ?? ({ recentInvalid: 0, recentErrors: 0 } as unknown as ModelStat));
-				const tags = [
-					stat ? fmtMs(statVerdict(stat, needTokens).ttftMs) : "unmeasured",
-					candidate.contextWindow ? `${Math.round(candidate.contextWindow / 1000)}k` : "?ctx",
-					broken.invalid ? "❌ bad content" : "",
-					broken.failed ? "❌ failed" : "",
-				].filter(Boolean);
-				return `${candidate.id}: ${tags.join(" ")}`;
-			});
-			const chosen = await Promise.resolve(
-				chooseRoute({
-					candidates: routeCandidates(registry),
-					chain: routeChain(),
-					needTokens,
-					reason: "user",
-					previousId: ctx.model?.provider === cfg.provider ? ctx.model.id : undefined,
-					now: Date.now(),
-					quarantineMs: cfg.quarantineMs,
-				}),
-			);
-			const selected = ctx.model?.id === cfg.id ? " (selected)" : "";
-			ctx.ui.notify(
-				`[model-speed] ${cfg.provider}/${cfg.id}${selected} → ${chosen?.modelId ?? "none"}: ${lines.join(" | ")}`,
-				"info",
-			);
-		},
-	});
-
-	pi.registerCommand("speed-pick", {
-		description: "Print the model the health router would pick now — use it when dispatching a subagent",
-		handler: async (args, ctx) => {
-			const cfg = virtualConfig;
-			const registry = (ctx.modelRegistry ?? sessionCtx?.modelRegistry) as never;
-			const chain = routeChain();
-			if (chain.length === 0) {
-				ctx.ui.notify("[model-speed] no chain configured (virtual.chain or candidates in model-speed.json)", "warning");
-				return;
-			}
-			const needTokens = Math.max(Number(ctx.getContextUsage?.()?.tokens ?? 0), estimateNeedTokens([], 0)) + cfg.headroomTokens;
-			const choice = chooseRoute({
+	async function speedRouterHandler(ctx: ExtensionContext) {
+		const cfg = virtualConfig;
+		if (!cfg.enabled) {
+			ctx.ui.notify("[model-speed] virtual model is off (`virtual.enabled` in ~/.pi/agent/model-speed.json)", "info");
+			return;
+		}
+		const stats = await recentStats();
+		// Same rule as route(): live usage wins, the character estimate is the floor for a
+		// resumed session before the first response. With an empty estimate this command would
+		// advertise the 256k model as pickable for a 300k-token session and the next request
+		// would fail on it.
+		const needTokens = Math.max(Number(ctx.getContextUsage?.()?.tokens ?? 0), estimateNeedTokens([], 0)) + cfg.headroomTokens;
+		const registry = (sessionCtx?.modelRegistry ?? liveCtx?.modelRegistry) as never;
+		const lines = routeCandidates(registry).map((candidate) => {
+			const stat = stats.get(`${cfg.provider}/${candidate.id}`);
+			const broken = isBroken(stat ?? ({ recentInvalid: 0, recentErrors: 0 } as unknown as ModelStat));
+			const tags = [
+				stat ? fmtMs(statVerdict(stat, needTokens).ttftMs) : "unmeasured",
+				candidate.contextWindow ? `${Math.round(candidate.contextWindow / 1000)}k` : "?ctx",
+				broken.invalid ? "❌ bad content" : "",
+				broken.failed ? "❌ failed" : "",
+			].filter(Boolean);
+			return `${candidate.id}: ${tags.join(" ")}`;
+		});
+		const chosen = await Promise.resolve(
+			chooseRoute({
 				candidates: routeCandidates(registry),
-				chain,
+				chain: routeChain(),
 				needTokens,
-				reason: args.trim() === "retry" ? "retry" : "user",
-				previousId: undefined,
+				reason: "user",
+				previousId: ctx.model?.provider === cfg.provider ? ctx.model.id : undefined,
 				now: Date.now(),
 				quarantineMs: cfg.quarantineMs,
+			}),
+		);
+		const selected = ctx.model?.id === cfg.id ? " (selected)" : "";
+		ctx.ui.notify(
+			`[model-speed] ${cfg.provider}/${cfg.id}${selected} → ${chosen?.modelId ?? "none"}: ${lines.join(" | ")}`,
+			"info",
+		);
+	}
+
+	async function speedPickHandler(args: string, ctx: ExtensionContext) {
+		const cfg = virtualConfig;
+		const registry = (ctx.modelRegistry ?? sessionCtx?.modelRegistry) as never;
+		const chain = routeChain();
+		if (chain.length === 0) {
+			ctx.ui.notify("[model-speed] no chain configured (virtual.chain or candidates in model-speed.json)", "warning");
+			return;
+		}
+		const needTokens = Math.max(Number(ctx.getContextUsage?.()?.tokens ?? 0), estimateNeedTokens([], 0)) + cfg.headroomTokens;
+		const choice = chooseRoute({
+			candidates: routeCandidates(registry),
+			chain,
+			needTokens,
+			reason: args.trim() === "retry" ? "retry" : "user",
+			previousId: undefined,
+			now: Date.now(),
+			quarantineMs: cfg.quarantineMs,
+		});
+		const id = choice?.modelId;
+		if (!id) {
+			ctx.ui.notify("[model-speed] the router has no candidate; run /speed first", "warning");
+			return;
+		}
+		// Full provider-qualified id: a child launched with a bare id is what pi-subagents
+		// reports as `model_verification_failed` (bare vs `provider/id` comparison).
+		const fullId = `${cfg.provider}/${id}`;
+		ctx.ui.notify(`[model-speed] dispatch model: ${fullId} (chain: ${chain.join(" → ")}, need ~${Math.round(needTokens / 1000)}k ctx)`, "info");
+	}
+
+	async function speedProbeHandler(args: string, ctx: ExtensionContext) {
+		const tokens = args.trim().split(/\s+/).filter(Boolean);
+		const force = tokens.includes("--force");
+		const only = tokens.filter((token) => token !== "--force" && token !== "--external");
+		// Legacy escape hatch: some setups keep an out-of-band probe script. Refresh it on
+		// demand, but the native sampler is what keeps the window fresh otherwise.
+		if (tokens.includes("--external")) {
+			if (!probeSupported()) {
+				ctx.ui.notify("[model-speed] no probe.command configured", "warning");
+				return;
+			}
+			ctx.ui.notify("[model-speed] running external probe…", "info");
+			const output = await runProbe();
+			if (output) ctx.ui.notify(`[model-speed] probe: ${output.split("\n").slice(-3).join(" | ")}`, "info");
+			return;
+		}
+		if (only.length > 0) {
+			// Explicit ids get a forced run of exactly those models: a one-off question
+			// should not wait for the interval.
+			const models = only
+				.map((id) => (id.includes("/") ? id.split("/") : [ctx.model?.provider ?? "", id]))
+				.map(([provider, id]) => ctx.modelRegistry.find(provider, id))
+				.filter((model): model is NonNullable<typeof model> => Boolean(model));
+			if (models.length === 0) {
+				ctx.ui.notify(`[model-speed] no such model: ${only.join(", ")}`, "warning");
+				return;
+			}
+			const outcomes = await sampleModels(ctx.modelRegistry as unknown as StreamRegistry, models, {
+				promptTokens: config.sampling.promptTokens,
+				maxTokens: config.sampling.maxTokens,
+				timeoutMs: config.sampling.timeoutMs,
+				gapMs: config.sampling.gapMs,
+				onOutcome: async (outcome) => {
+					if (outcome.error === "AbortError" || /abort/i.test(String(outcome.error ?? ""))) return;
+					await appendLog({ pid: process.pid, ...outcome });
+				},
 			});
-			const id = choice?.modelId;
-			if (!id) {
-				ctx.ui.notify("[model-speed] the router has no candidate; run /speed first", "warning");
-				return;
-			}
-			// Full provider-qualified id: a child launched with a bare id is what pi-subagents
-			// reports as `model_verification_failed` (bare vs `provider/id` comparison).
-			const fullId = `${cfg.provider}/${id}`;
-			ctx.ui.notify(`[model-speed] dispatch model: ${fullId} (chain: ${chain.join(" → ")}, need ~${Math.round(needTokens / 1000)}k ctx)`, "info");
-		},
-	});
-
-	pi.registerCommand("speed-probe", {
-		description: "Sample the pool now (background by default): /speed-probe [--force] [model ...]",
-		handler: async (args, ctx) => {
-			const tokens = args.trim().split(/\s+/).filter(Boolean);
-			const force = tokens.includes("--force");
-			const only = tokens.filter((token) => token !== "--force" && token !== "--external");
-			// Legacy escape hatch: some setups keep an out-of-band probe script. Refresh it on
-			// demand, but the native sampler is what keeps the window fresh otherwise.
-			if (tokens.includes("--external")) {
-				if (!probeSupported()) {
-					ctx.ui.notify("[model-speed] no probe.command configured", "warning");
-					return;
-				}
-				ctx.ui.notify("[model-speed] running external probe…", "info");
-				const output = await runProbe();
-				if (output) ctx.ui.notify(`[model-speed] probe: ${output.split("\n").slice(-3).join(" | ")}`, "info");
-				return;
-			}
-			if (only.length > 0) {
-				// Explicit ids get a forced run of exactly those models: a one-off question
-				// should not wait for the interval.
-				const models = only
-					.map((id) => (id.includes("/") ? id.split("/") : [ctx.model?.provider ?? "", id]))
-					.map(([provider, id]) => ctx.modelRegistry.find(provider, id))
-					.filter((model): model is NonNullable<typeof model> => Boolean(model));
-				if (models.length === 0) {
-					ctx.ui.notify(`[model-speed] no such model: ${only.join(", ")}`, "warning");
-					return;
-				}
-				const outcomes = await sampleModels(ctx.modelRegistry as unknown as StreamRegistry, models, {
-					promptTokens: config.sampling.promptTokens,
-					maxTokens: config.sampling.maxTokens,
-					timeoutMs: config.sampling.timeoutMs,
-					gapMs: config.sampling.gapMs,
-					onOutcome: async (outcome) => {
-						if (outcome.error === "AbortError" || /abort/i.test(String(outcome.error ?? ""))) return;
-						await appendLog({ pid: process.pid, ...outcome });
-					},
-				});
-				statsCache = undefined;
-				await writeStatsSnapshot(await recentStats(true));
-				const lines = outcomes.map((outcome) =>
-					outcome.ok ? `${outcome.model}: ${fmtMs(outcome.ttftMs)} · ${outcome.tokensPerSec ?? "?"} tok/s` : `${outcome.model}: failed (${outcome.error ?? outcome.status})`,
-				);
-				ctx.ui.notify(`[model-speed] ${lines.join(" | ")}`, "info");
-				return;
-			}
-			if (force) {
-				const outcomes = await maybeSample(ctx, { force: true, notify: true, why: "command" });
-				if (outcomes.length === 0) ctx.ui.notify("[model-speed] nothing to sample (disabled, busy, or every model is fresh)", "info");
-				return;
-			}
-			ctx.ui.notify("[model-speed] sampling the stale models in the background…", "info");
-			void maybeSample(ctx, { force: true, notify: true, why: "command" }).catch(() => undefined);
-		},
-	});
-
-	pi.registerCommand("speed-stats", {
-		description: "This session's TTFT/TPOT medians plus the rolling recent window",
-		handler: async (_args, ctx) => {
-			const recent = await renderRecent(ctx);
-			const session: string[] = [];
-			if (samples.length > 0) {
-				const byModel = new Map<string, Sample[]>();
-				const seen = new Set<number>();
-				for (const sample of samples) {
-					if (seen.has(sample.startedAt)) continue; // two extension instances can record the same call
-					seen.add(sample.startedAt);
-					const key = sample.model || "?";
-					byModel.set(key, [...(byModel.get(key) ?? []), sample]);
-				}
-				session.push(...[...byModel].map(([model, list]) => {
-					const ttft = list.map((s) => s.ttftMs).filter((v): v is number => typeof v === "number");
-					const tps = list
-						.map((s) => (typeof s.tpotMs === "number" && s.tpotMs > 0 ? 1000 / s.tpotMs : undefined))
-						.filter((v): v is number => typeof v === "number");
-					return `${model}: n=${list.length} TTFT median=${fmtMs(ttft.length ? median(ttft) : undefined)} ${tps.length ? `${Math.round(median(tps))} tok/s` : "—"}`;
-				}));
-			}
-			ctx.ui.notify(`[model-speed] ${[...recent, ...session].join(" | ") || "no samples yet"}`, "info");
-			const memory = (await readSwitchState()).sessions?.[sessionKey];
-			if (memory && (memory.switches > 0 || memory.target)) {
-				ctx.ui.notify(
-					`[model-speed] this session already used ${memory.switches}/${config.maxSwitchesPerSession} switch(es)` +
-						(memory.target ? `, now on ${memory.target}` : "") +
-						` — remembered across reload/resume (${fmtAgeSpan(memory.updatedAt ? Date.now() - memory.updatedAt : undefined)})`,
-					"info",
-				);
-			}
-		},
-	});
-
-	pi.registerCommand("speed-auto", {
-		description: "Turn slow-model failover on or off: /speed-auto on|off",
-		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
-			if (arg !== "on" && arg !== "off") {
-				ctx.ui.notify(`[model-speed] auto failover is ${config.auto ? "on" : "off"} (usage: /speed-auto on|off)`, "info");
-				return;
-			}
-			config = { ...config, auto: arg === "on" };
-			const pinned = PINNED_CHILD && !AUTO_IN_CHILD;
-			ctx.ui.notify(
-				pinned
-					? `[model-speed] auto failover is pinned off in ${SUBAGENT_CHILD ? "pi-subagents" : "Fabric"} child sessions (a mid-run switch makes the parent report model drift and fails the run); sampling continues`
-					: `[model-speed] auto failover ${config.auto ? "on" : "off"} for this session`,
-				"info",
+			statsCache = undefined;
+			await writeStatsSnapshot(await recentStats(true));
+			const lines = outcomes.map((outcome) =>
+				outcome.ok ? `${outcome.model}: ${fmtMs(outcome.ttftMs)} · ${outcome.tokensPerSec ?? "?"} tok/s` : `${outcome.model}: failed (${outcome.error ?? outcome.status})`,
 			);
-		},
+			ctx.ui.notify(`[model-speed] ${lines.join(" | ")}`, "info");
+			return;
+		}
+		if (force) {
+			const outcomes = await maybeSample(ctx, { force: true, notify: true, why: "command" });
+			if (outcomes.length === 0) ctx.ui.notify("[model-speed] nothing to sample (disabled, busy, or every model is fresh)", "info");
+			return;
+		}
+		ctx.ui.notify("[model-speed] sampling the stale models in the background…", "info");
+		void maybeSample(ctx, { force: true, notify: true, why: "command" }).catch(() => undefined);
+	}
+
+	async function speedAutoHandler(args: string, ctx: ExtensionContext) {
+		const arg = args.trim().toLowerCase();
+		if (arg !== "on" && arg !== "off") {
+			ctx.ui.notify(`[model-speed] auto failover is ${config.auto ? "on" : "off"} (usage: /speed auto on|off)`, "info");
+			return;
+		}
+		config = { ...config, auto: arg === "on" };
+		const pinned = PINNED_CHILD && !AUTO_IN_CHILD;
+		ctx.ui.notify(
+			pinned
+				? `[model-speed] auto failover is pinned off in ${SUBAGENT_CHILD ? "pi-subagents" : "Fabric"} child sessions (a mid-run switch makes the parent report model drift and fails the run); sampling continues`
+				: `[model-speed] auto failover ${config.auto ? "on" : "off"} for this session`,
+			"info",
+		);
+	}
+
+	// One command, subcommands as arguments — pi command style. `/speed` shows the table
+	// (temporary widget + notification), `close` dismisses it, and the rest map to what used
+	// to be separate `/speed-*` commands.
+	async function speedHandler(args: string, ctx: ExtensionContext) {
+		const tokens = args.trim().split(/\s+/).filter(Boolean);
+		const sub = (tokens[0] ?? "").toLowerCase();
+		const rest = tokens.slice(1).join(" ");
+		switch (sub) {
+			case "":
+				await speedShowHandler(ctx);
+				return;
+			case "close":
+				closeWidget(ctx);
+				return;
+			case "stats":
+				await speedStatsHandler(ctx);
+				return;
+			case "router":
+				await speedRouterHandler(ctx);
+				return;
+			case "pick":
+				await speedPickHandler(rest, ctx);
+				return;
+			case "probe":
+				await speedProbeHandler(rest, ctx);
+				return;
+			case "auto":
+				await speedAutoHandler(rest, ctx);
+				return;
+			default:
+				ctx.ui.notify(`[model-speed] unknown subcommand "${sub}" — usage: /speed [close|stats|probe|router|pick|auto]`, "warning");
+		}
+	}
+
+	async function speedShowHandler(ctx: ExtensionContext) {
+		const recent = await renderRecent(ctx);
+		ctx.ui.notify(
+			recent.length ? `[model-speed] recent: ${recent.join(" | ")}` : "[model-speed] no samples in the recent window yet — /speed probe to take some now",
+			"info",
+		);
+		const ranked = await renderRanking(ctx);
+		if (ranked.length) ctx.ui.notify(`[model-speed] candidates: ${ranked.join(" | ")}`, "info");
+		showWidgetTemporarily(ctx, [
+			...recent,
+			...(ranked.length ? ["", "same-provider candidates (fastest first):", ...ranked] : []),
+			"",
+			`(${SPEED_WIDGET_TTL_MS / 1000}s auto-close · /speed close to dismiss)`,
+		]);
+		// `/speed` is history-first: refresh in the background instead of blocking the TUI
+		// on a synchronous probe.
+		void maybeSample(ctx, { why: "speed" }).catch(() => undefined);
+	}
+
+	// One command, subcommands as arguments — the pi way (like built-in `/mcp`, `/model`).
+	// Autocomplete is what makes those subcommands discoverable: without it `/speed ` offers
+	// nothing to pick and the subcommand vocabulary is invisible (the same gap that was fixed
+	// for `/sudo-ttl`). Values must be the **whole argument string**, not the bare keyword —
+	// pi replaces the entire argument text with `value`, so returning "probe" for a prefix of
+	// "pro" would erase nothing else but returning it for "probe " would drop the space the
+	// next level needs (bundled `/mcp` returns `${action} ` for exactly this reason).
+	const SPEED_SUBCOMMANDS: Array<{ value: string; label: string; description: string }> = [
+		{ value: "", label: "(no argument)", description: "show the rolling window + ranked candidates" },
+		{ value: "close", label: "close", description: "dismiss the table widget" },
+		{ value: "stats", label: "stats", description: "this session's medians + remembered switch budget" },
+		{ value: "probe", label: "probe", description: "sample the stale pool models now (background)" },
+		{ value: "router", label: "router", description: "virtual model: chain, per-model health, next pick" },
+		{ value: "pick", label: "pick", description: "provider-qualified model to use for a subagent" },
+		{ value: "auto", label: "auto", description: "turn slow-model failover on/off" },
+	];
+
+	function speedArgumentCompletions(prefix: string) {
+		const text = prefix.startsWith(" ") ? prefix.slice(1) : prefix;
+		const parts = text.split(/\s+/);
+		// A trailing space means "the next word starts here".
+		const trailing = /\s$/.test(text);
+		const words = trailing ? parts.slice(0, -1) : parts;
+		const current = trailing ? "" : (words.pop() ?? "");
+		const head = words[0]?.toLowerCase() ?? "";
+
+		// Level 1: the subcommand itself. Values carry the trailing space so the editor lets
+		// the user keep typing arguments instead of closing the popup.
+		if (words.length === 0) {
+			const items = SPEED_SUBCOMMANDS.filter((item) => item.value.startsWith(current.toLowerCase())).map(
+				(item) => (item.value === "" ? item : { ...item, value: `${item.value} ` }),
+			);
+			return items.length > 0 ? items : null;
+		}
+
+		// Level 2: arguments of one subcommand.
+		if (words.length === 1) {
+			const done = new Set(words.slice(1));
+			if (head === "auto") {
+				const items = [
+					{ value: "on", label: "on", description: "fail over to a clearly faster same-provider model" },
+					{ value: "off", label: "off", description: "keep the current model, just report" },
+				].filter((item) => item.value.startsWith(current.toLowerCase()));
+				return items.length > 0 ? items.map((item) => ({ ...item, value: `auto ${item.value}` })) : null;
+			}
+			if (head === "pick") {
+				const items = [{ value: "retry", label: "retry", description: "pick as a retry: skip the model that just failed" }].filter((item) =>
+					item.value.startsWith(current.toLowerCase()),
+				);
+				return items.length > 0 ? items.map((item) => ({ ...item, value: `pick ${item.value}` })) : null;
+			}
+			if (head === "probe") {
+				const flags = [
+					{ value: "--force", label: "--force", description: "ignore the sampling interval" },
+					{ value: "--external", label: "--external", description: "run the legacy external probe script" },
+				].filter((flag) => !done.has(flag.value) && flag.value.startsWith(current));
+				// Model ids are the other half of `/speed probe`: same-provider models first,
+				// provider-qualified so the argument is unambiguous.
+				const registry = (sessionCtx?.modelRegistry ?? liveCtx?.modelRegistry) as
+					| { getAvailable?: () => Array<{ provider: string; id: string }> }
+					| undefined;
+				const provider = (sessionCtx ?? liveCtx)?.model?.provider;
+				const models = (registry?.getAvailable?.() ?? [])
+					.filter((model) => !isVirtual(model as { api?: string }) && (model.provider === provider || !provider))
+					.map((model) => ({ value: model.id, label: model.id, description: model.provider }))
+					.filter((item) => !done.has(item.value) && item.value.startsWith(current));
+				const items = [...flags, ...models];
+				return items.length > 0 ? items.map((item) => ({ ...item, value: `probe ${item.value}` })) : null;
+			}
+			return null;
+		}
+		return null;
+	}
+
+	pi.registerCommand("speed", {
+		description: "Measured TTFT / tok-s per model — /speed [close|stats|probe|router|pick|auto]",
+		getArgumentCompletions: speedArgumentCompletions,
+		handler: speedHandler,
 	});
 
 	pi.on("session_shutdown", async () => {

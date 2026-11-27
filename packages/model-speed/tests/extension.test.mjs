@@ -127,22 +127,49 @@ test("a retry inside the virtual model steps off the model that failed", () => {
 	assert.ok(routed.state?.quarantine?.a > Date.now());
 });
 
-test("/speed-router and /speed-pick answer without throwing and name a chain model", async () => {
+test("/speed router and /speed pick answer without throwing and name a chain model", async () => {
 	const pi = fakePi();
 	modelSpeed(pi);
-	const router = pi.commands.get("speed-router");
-	assert.ok(router, "speed-router is registered");
+	const speed = pi.commands.get("speed");
+	assert.ok(speed, "speed is registered");
+	// One command, not five: the old /speed-* spellings must be gone from the command list.
+	assert.deepEqual([...pi.commands.keys()], ["speed"], "no leftover /speed-* commands");
+
 	notifies.length = 0;
-	await router.handler("", fakeCtx);
+	await speed.handler("router", fakeCtx);
 	assert.equal(notifies.length, 1);
 	assert.match(notifies[0].message, /test-pool\/test-auto/);
 
-	const pick = pi.commands.get("speed-pick");
-	assert.ok(pick, "speed-pick is registered");
 	notifies.length = 0;
-	await pick.handler("", fakeCtx);
+	await speed.handler("pick", fakeCtx);
 	assert.equal(notifies.length, 1);
-	// `/speed-pick` must hand out a provider-qualified id: a bare id is what pi-subagents
+	// `pick` must hand out a provider-qualified id: a bare id is what pi-subagents
 	// reports as `model_verification_failed`.
 	assert.match(notifies[0].message, /dispatch model: test-pool\/[abc]/);
+});
+
+test("/speed autocompletes its subcommands with whole-argument values", () => {
+	const pi = fakePi();
+	modelSpeed(pi);
+	const complete = pi.commands.get("speed").getArgumentCompletions;
+	assert.equal(typeof complete, "function", "subcommands must be discoverable in the TUI");
+
+	// Level 1: prefix filter, and a trailing space so arguments can follow.
+	const all = complete("");
+	assert.ok(all.some((item) => item.value === "stats " && item.label === "stats"));
+	const pro = complete("pro");
+	assert.deepEqual(pro.map((item) => item.value), ["probe "], "values keep the trailing space");
+	assert.equal(complete("zzz"), null);
+
+	// Level 2: arguments of one subcommand, still whole-argument values.
+	const auto = complete("auto ");
+	assert.deepEqual(auto.map((item) => item.value), ["auto on", "auto off"]);
+	const forced = complete("probe --f");
+	assert.deepEqual(forced.map((item) => item.value), ["probe --force"]);
+	// Every level-2 value repeats its subcommand: pi replaces the whole argument text.
+	const pick = complete("pick ");
+	assert.deepEqual(pick.map((item) => item.value), ["pick retry"]);
+
+	// An unknown word gets no invented suggestions.
+	assert.equal(complete("stats "), null);
 });
